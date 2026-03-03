@@ -109,13 +109,15 @@ def process_kml(file_content):
     df = pd.DataFrame(data)
     if df.empty: return df
 
+    # Basic Time and Altitude Math
     df['Time'] = pd.to_datetime(df['Time'])
     df['Dt'] = df['Time'].diff().dt.total_seconds().fillna(1)
-    df['Cumulative_Min'] = df['Dt'].cumsum() / 60.0  # Added for the time slider
+    df['Cumulative_Min'] = df['Dt'].cumsum() / 60.0 
     
     df['Alt_Smooth'] = df['Alt_Raw'].rolling(window=7, center=True, min_periods=1).mean()
     df['VSI'] = (df['Alt_Smooth'].diff() / (df['Dt'] / 60.0)).fillna(0).rolling(5).mean()
     
+    # Distance and Bearing Math
     dist, bear = [0], [0]
     for i in range(1, len(df)):
         dist.append(haversine_distance(df.iloc[i-1]['Lat'], df.iloc[i-1]['Lon'], df.iloc[i]['Lat'], df.iloc[i]['Lon']))
@@ -124,15 +126,30 @@ def process_kml(file_content):
     df['GS'] = (pd.Series(dist) / (df['Dt'] / 3600.0)).fillna(0).rolling(5).mean()
     df['Track'] = bear
     
+    # Turn Detection Math
     df['Track_Delta'] = df['Track'].diff().abs()
     df['Track_Delta'] = df['Track_Delta'].apply(lambda x: 360 - x if x > 180 else x).fillna(0)
     df['Turn_Rate'] = (df['Track_Delta'] / df['Dt']).rolling(window=3).mean()
+    
+    # --- ADVANCED AERODYNAMICS MATH ---
+    g = 32.174 # Gravity in ft/s^2
+    df['Vel_fps'] = df['GS'] * 1.68781 # Knots to ft/s
+    
+    # Bank Angle = atan( (Turn_Rate_Rad * Vel_fps) / g )
+    turn_rate_rad = np.radians(df['Turn_Rate'])
+    df['Bank_Angle'] = np.degrees(np.arctan((turn_rate_rad * df['Vel_fps']) / g)).fillna(0)
+    
+    # G-Load = 1 / cos(Bank_Angle_Rad). Capped at 3G to filter GPS anomalies
+    df['G_Load'] = (1 / np.cos(np.radians(df['Bank_Angle']))).clip(1, 3)
+    
+    # Specific Energy = Altitude + (Velocity^2 / 2g)
+    df['Specific_Energy'] = df['Alt_Smooth'] + ((df['Vel_fps']**2) / (2 * g))
     
     return df
 
 # --- UI Layout ---
 st.title("🛰️ T.G. TACTICAL FLIGHT DEBRIEF")
-st.markdown("`SYSTEM STATUS: ONLINE | AWAITING TELEMETRY INGESTION`")
+st.markdown("`SYSTEM STATUS: ONLINE | ADVANCED AERO ENGINE ARMED`")
 
 uploaded = st.file_uploader("", type=['kml'])
 
@@ -142,14 +159,13 @@ if uploaded:
     
     if not df.empty:
         metar = fetch_metar(df['Lat'].iloc[0], df['Lon'].iloc[0])
+        total_mins = int(df['Dt'].sum()/60)
         
         st.markdown("### 📡 INITIAL CONDITIONS & TELEMETRY")
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("PEAK ALTITUDE", f"{int(df['Alt_Smooth'].max())} FT MSL")
         col2.metric("MAX GROUNDSPEED", f"{int(df['GS'].max())} KTS")
-        col3.metric("MAX SINK RATE", f"{int(df['VSI'].min())} FPM")
-        
-        total_mins = int(df['Dt'].sum()/60)
+        col3.metric("MAX G-LOAD", f"+{df['G_Load'].max():.1f} G")
         col4.metric("TOTAL SORTIE", f"{total_mins} MIN")
 
         if metar:
@@ -170,7 +186,7 @@ if uploaded:
                 entry_alt = mdata['Alt_Smooth'].iloc[0]
                 max_dev = max(mdata['Alt_Smooth'].max() - entry_alt, entry_alt - mdata['Alt_Smooth'].min())
                 
-                # BUG FIX: Cap the maneuver detection so it doesn't grade a 1000 degree holding pattern as a steep turn
+                # Maneuver Detection Cap
                 if total_turn >= 750:
                     label = "EXTENDED CIRCLING / HOLD"
                     color = "#888888"
@@ -186,27 +202,25 @@ if uploaded:
 
                 with st.expander(f"MNVR {found_mnvrs} | {label} | TURN: {int(total_turn)}°"):
                     st.markdown(f"**STATUS:** <span style='color:{color}'>{status}</span> (DEV: {int(max_dev)}FT)", unsafe_allow_html=True)
-                    st.write(f"`ENTRY ALT: {int(entry_alt)} FT | DURATION: {int(duration)}s`")
+                    st.write(f"`ENTRY ALT: {int(entry_alt)} FT | DURATION: {int(duration)}s | PEAK G: +{mdata['G_Load'].max():.1f}G`")
                     if label == "360° STEEP TURN":
                         wind = (mdata['GS'].max() - mdata['GS'].min()) / 2
                         st.write(f"`ESTIMATED WINDS ALOFT: {int(wind)} KTS`")
 
-        st.markdown("### 🗺️ SPATIAL TELEMETRY")
-        t1, t2, t3 = st.tabs(["3D AIRWAY CORRIDOR", "TACTICAL MAP", "ALTITUDE PROFILE"])
+        st.markdown("### 🗺️ SPATIAL TELEMETRY & PHYSICS")
+        t1, t2, t3, t4 = st.tabs(["3D AIRWAY CORRIDOR", "2D TACTICAL MAP", "AERODYNAMICS", "APPROACH ENVELOPE"])
         
         with t1:
             st.write("`USE SLIDERS TO CROP OUT TAXI, CLIMB, AND HOLDING PATTERN RUBBISH`")
-            # 1. THE AIRWAY TRIMMER SLIDER
             trim_start, trim_end = st.slider(
                 "SELECT PRACTICE AREA TIMEFRAME (MINUTES)", 
                 0, total_mins, (int(total_mins * 0.15), int(total_mins * 0.85))
             )
             
-            # 2. THE AIRBORNE + TRIM + AUTO-FLOOR FILTER
             field_elevation = df['Alt_Smooth'].min()
             airborne_df = df[
                 (df['GS'] > 35) & 
-                (df['Alt_Smooth'] > (field_elevation + 200)) & # Clears the runway/pattern junk
+                (df['Alt_Smooth'] > (field_elevation + 200)) & 
                 (df['Cumulative_Min'] >= trim_start) & 
                 (df['Cumulative_Min'] <= trim_end)
             ]
@@ -223,7 +237,7 @@ if uploaded:
                         width=6,
                         colorbar=dict(title="KTS")
                     ),
-                    text=[f"ALT: {alt:.0f} FT<br>GS: {gs:.0f} KTS" for alt, gs in zip(airborne_df['Alt_Smooth'], airborne_df['GS'])],
+                    text=[f"ALT: {alt:.0f} FT<br>GS: {gs:.0f} KTS<br>BANK: {bk:.0f}°" for alt, gs, bk in zip(airborne_df['Alt_Smooth'], airborne_df['GS'], airborne_df['Bank_Angle'])],
                     hoverinfo="text"
                 ))
                 
@@ -245,17 +259,40 @@ if uploaded:
                 st.warning("`WARNING: NO DATA REMAINS AFTER CURRENT CROP SELECTION.`")
 
         with t2:
+            st.write("`COLOR CODED BY TURN RATE (HIGHLIGHTS GROUND REFERENCE MANEUVERS)`")
             fig_map = px.scatter_mapbox(
-                df, lat="Lat", lon="Lon", color="VSI",
-                color_continuous_scale="RdBu_r", range_color=[-1000, 1000],
-                zoom=10, height=600
+                df, lat="Lat", lon="Lon", color="Turn_Rate",
+                color_continuous_scale="Plasma", range_color=[0, 4],
+                zoom=10, height=600, hover_data=["Alt_Smooth", "Bank_Angle", "G_Load"]
             )
             fig_map.update_layout(mapbox_style="carto-darkmatter", template="plotly_dark", margin=dict(l=0,r=0,b=0,t=0))
             st.plotly_chart(fig_map, use_container_width=True)
 
         with t3:
-            fig_alt = go.Figure()
-            fig_alt.add_trace(go.Scatter(x=df['Time'], y=df['Alt_Raw'], name="RAW SENSOR", line=dict(color="rgba(255,0,0,0.3)", width=1)))
-            fig_alt.add_trace(go.Scatter(x=df['Time'], y=df['Alt_Smooth'], name="MFD SMOOTHED", line=dict(color="#00FF41", width=3)))
-            fig_alt.update_layout(template="plotly_dark", xaxis_title="TIME (UTC)", yaxis_title="ALTITUDE (FT MSL)")
-            st.plotly_chart(fig_alt, use_container_width=True)
+            st.write("`SPECIFIC ENERGY STATE & ESTIMATED BANK ANGLES`")
+            fig_aero = go.Figure()
+            # Energy State
+            fig_aero.add_trace(go.Scatter(x=df['Time'], y=df['Specific_Energy'], name="SPECIFIC ENERGY (FT)", line=dict(color="#FF9F1C", width=2)))
+            fig_aero.add_trace(go.Scatter(x=df['Time'], y=df['Alt_Smooth'], name="POTENTIAL ENERGY (ALT)", line=dict(color="#00FF41", width=2, dash='dot')))
+            fig_aero.update_layout(template="plotly_dark", xaxis_title="TIME (UTC)", yaxis_title="ENERGY STATE", height=400)
+            st.plotly_chart(fig_aero, use_container_width=True)
+            
+            # Bank & G-Load
+            fig_bank = go.Figure()
+            fig_bank.add_trace(go.Scatter(x=df['Time'], y=df['Bank_Angle'], name="ESTIMATED BANK (°)", line=dict(color="#00FFFF", width=2)))
+            fig_bank.update_layout(template="plotly_dark", xaxis_title="TIME (UTC)", yaxis_title="BANK ANGLE", height=300)
+            st.plotly_chart(fig_bank, use_container_width=True)
+
+        with t4:
+            st.write("`APPROACH ENVELOPE: VSI vs GROUNDSPEED (IDEAL APPROACH IS CLUSTERED)`")
+            # Filter to approach speeds and descents
+            approach_df = df[(df['VSI'] < -100) & (df['GS'] < 100) & (df['Alt_Smooth'] < (field_elevation + 2000))]
+            if not approach_df.empty:
+                fig_env = px.scatter(
+                    approach_df, x="GS", y="VSI", color="Alt_Smooth", 
+                    color_continuous_scale="Viridis", title="STABILIZED APPROACH SCATTER"
+                )
+                fig_env.update_layout(template="plotly_dark", height=600)
+                st.plotly_chart(fig_env, use_container_width=True)
+            else:
+                st.info("`NO APPROACH DATA DETECTED IN LOG.`")
