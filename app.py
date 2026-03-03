@@ -27,7 +27,6 @@ st.markdown("""
         font-family: 'JetBrains Mono', monospace;
     }
     
-    /* Tactical Headers */
     h1, h2, h3 {
         color: #FF9F1C !important; 
         text-transform: uppercase;
@@ -36,7 +35,6 @@ st.markdown("""
         padding-bottom: 5px;
     }
 
-    /* Industrial Metric Cards */
     div[data-testid="metric-container"] {
         background-color: #0F0F0F;
         border: 1px solid #333333;
@@ -49,11 +47,10 @@ st.markdown("""
         font-size: 0.8rem !important;
     }
     div[data-testid="metric-container"] div {
-        color: #00FF41 !important; /* Radar Green */
+        color: #00FF41 !important; 
         font-weight: 700 !important;
     }
 
-    /* MFD Style Expander */
     .streamlit-expanderHeader {
         background-color: #0F0F0F !important;
         color: #FF9F1C !important;
@@ -61,13 +58,11 @@ st.markdown("""
         border-radius: 0px !important;
     }
 
-    /* Custom File Uploader */
     .stFileUploader {
         border: 1px dashed #FF9F1C;
         background-color: #0F0F0F;
     }
 
-    /* Info/Success Boxes */
     div[data-testid="stNotification"] {
         background-color: #0F0F0F !important;
         border-radius: 0px !important;
@@ -77,7 +72,7 @@ st.markdown("""
 
 # --- Math & Aerodynamic Logic ---
 def haversine_distance(lat1, lon1, lat2, lon2):
-    R = 3440.065 # Nautical Miles
+    R = 3440.065 
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
     delta_phi, delta_lambda = math.radians(lat2 - lat1), math.radians(lon2 - lon1)
     a = math.sin(delta_phi/2.0)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(delta_lambda/2.0)**2
@@ -110,10 +105,10 @@ def process_kml(file_content):
         c_parts = c.text.split()
         if len(c_parts) == 3:
             data.append({
-                'Time': t.text.replace('Z', ''), # Fix ForeFlight PMZ/AMZ Bug
+                'Time': t.text.replace('Z', ''),
                 'Lon': float(c_parts[0]),
                 'Lat': float(c_parts[1]),
-                'Alt_Raw': float(c_parts[2]) * 3.28084 # Meters to Feet
+                'Alt_Raw': float(c_parts[2]) * 3.28084 
             })
             
     df = pd.DataFrame(data)
@@ -122,11 +117,9 @@ def process_kml(file_content):
     df['Time'] = pd.to_datetime(df['Time'])
     df['Dt'] = df['Time'].diff().dt.total_seconds().fillna(1)
     
-    # Advanced Smoothing (The "Radar Filter")
     df['Alt_Smooth'] = df['Alt_Raw'].rolling(window=7, center=True, min_periods=1).mean()
     df['VSI'] = (df['Alt_Smooth'].diff() / (df['Dt'] / 60.0)).fillna(0).rolling(5).mean()
     
-    # Ground Track & Turn Math
     dist, bear = [0], [0]
     for i in range(1, len(df)):
         dist.append(haversine_distance(df.iloc[i-1]['Lat'], df.iloc[i-1]['Lon'], df.iloc[i]['Lat'], df.iloc[i]['Lon']))
@@ -135,7 +128,6 @@ def process_kml(file_content):
     df['GS'] = (pd.Series(dist) / (df['Dt'] / 3600.0)).fillna(0).rolling(5).mean()
     df['Track'] = bear
     
-    # Maneuver Detection (State Machine Logic)
     df['Track_Delta'] = df['Track'].diff().abs()
     df['Track_Delta'] = df['Track_Delta'].apply(lambda x: 360 - x if x > 180 else x).fillna(0)
     df['Turn_Rate'] = (df['Track_Delta'] / df['Dt']).rolling(window=3).mean()
@@ -153,7 +145,6 @@ if uploaded:
     df = process_kml(raw_content)
     
     if not df.empty:
-        # 1. WEATHER & KEY METRICS
         metar = fetch_metar(df['Lat'].iloc[0], df['Lon'].iloc[0])
         
         st.markdown("### 📡 INITIAL CONDITIONS & TELEMETRY")
@@ -166,7 +157,6 @@ if uploaded:
         if metar:
             st.info(f"📍 **SURFACE WX ({metar.get('icaoId')}):** `{metar.get('rawOb')}`")
 
-        # 2. SMART MANEUVER GRADING
         st.markdown("### 🎯 ACS MANEUVER ANALYSIS")
         
         df['In_Maneuver'] = df['Turn_Rate'] > 1.8
@@ -177,7 +167,6 @@ if uploaded:
             total_turn = mdata['Track_Delta'].sum()
             duration = mdata['Dt'].sum()
             
-            # Filter: Maneuvers must be > 15s and > 150deg turn
             if duration > 15 and total_turn > 150:
                 found_mnvrs += 1
                 entry_alt = mdata['Alt_Smooth'].iloc[0]
@@ -194,20 +183,43 @@ if uploaded:
                         wind = (mdata['GS'].max() - mdata['GS'].min()) / 2
                         st.write(f"`ESTIMATED WINDS ALOFT: {int(wind)} KTS`")
 
-        # 3. ADVANCED VISUALS
         st.markdown("### 🗺️ SPATIAL TELEMETRY")
-        t1, t2, t3 = st.tabs(["3D TRAJECTORY", "TACTICAL MAP", "ALTITUDE PROFILE"])
+        t1, t2, t3 = st.tabs(["3D AIRWAY CORRIDOR", "TACTICAL MAP", "ALTITUDE PROFILE"])
         
         with t1:
-            # FIX: Using Scatter3D as a point-cloud to simulate a color-coded line
-            fig_3d = px.scatter_3d(
-                df, x='Lon', y='Lat', z='Alt_Smooth',
-                color='GS', color_continuous_scale='Inferno',
-                labels={'GS': 'KTS'},
-                title="3D SORTIE TRAJECTORY (SPEED CODED)"
+            # 1. THE AIRBORNE FILTER: Strip out the taxiway spaghetti
+            airborne_df = df[df['GS'] > 35]
+            
+            # 2. THE RIBBON UPGRADE: True 3D line instead of scatter dots
+            fig_3d = go.Figure(data=go.Scatter3d(
+                x=airborne_df['Lon'],
+                y=airborne_df['Lat'],
+                z=airborne_df['Alt_Smooth'],
+                mode='lines',
+                line=dict(
+                    color=airborne_df['GS'],
+                    colorscale='Inferno',
+                    width=6,
+                    colorbar=dict(title="KTS")
+                ),
+                text=[f"ALT: {alt:.0f} FT<br>GS: {gs:.0f} KTS" for alt, gs in zip(airborne_df['Alt_Smooth'], airborne_df['GS'])],
+                hoverinfo="text"
+            ))
+            
+            # 3. THE ASPECT RATIO FIX: Force the box to be wide and flat
+            fig_3d.update_layout(
+                title="3D TRAJECTORY (AIRBORNE ONLY)",
+                template="plotly_dark", 
+                height=700, 
+                margin=dict(l=0,r=0,b=0,t=40),
+                scene=dict(
+                    xaxis_title="LONGITUDE",
+                    yaxis_title="LATITUDE",
+                    zaxis_title="ALTITUDE (FT)",
+                    aspectmode='manual',
+                    aspectratio=dict(x=1, y=1, z=0.4) # Flattens the Z-axis distortion
+                )
             )
-            fig_3d.update_traces(marker=dict(size=2))
-            fig_3d.update_layout(template="plotly_dark", height=700, margin=dict(l=0,r=0,b=0,t=40))
             st.plotly_chart(fig_3d, use_container_width=True)
 
         with t2:
