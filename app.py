@@ -62,6 +62,12 @@ st.markdown("""
         background-color: #0F0F0F !important;
         border-radius: 0px !important;
     }
+    /* Style the dropdowns to look like avionics menus */
+    div[data-baseweb="select"] > div {
+        background-color: #0F0F0F !important;
+        border: 1px solid #FF9F1C !important;
+        color: #00FF41 !important;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -109,7 +115,6 @@ def process_kml(file_content):
     df = pd.DataFrame(data)
     if df.empty: return df
 
-    # Basic Time and Altitude Math
     df['Time'] = pd.to_datetime(df['Time'])
     df['Dt'] = df['Time'].diff().dt.total_seconds().fillna(1)
     df['Cumulative_Min'] = df['Dt'].cumsum() / 60.0 
@@ -117,7 +122,6 @@ def process_kml(file_content):
     df['Alt_Smooth'] = df['Alt_Raw'].rolling(window=7, center=True, min_periods=1).mean()
     df['VSI'] = (df['Alt_Smooth'].diff() / (df['Dt'] / 60.0)).fillna(0).rolling(5).mean()
     
-    # Distance and Bearing Math
     dist, bear = [0], [0]
     for i in range(1, len(df)):
         dist.append(haversine_distance(df.iloc[i-1]['Lat'], df.iloc[i-1]['Lon'], df.iloc[i]['Lat'], df.iloc[i]['Lon']))
@@ -126,23 +130,17 @@ def process_kml(file_content):
     df['GS'] = (pd.Series(dist) / (df['Dt'] / 3600.0)).fillna(0).rolling(5).mean()
     df['Track'] = bear
     
-    # Turn Detection Math
     df['Track_Delta'] = df['Track'].diff().abs()
     df['Track_Delta'] = df['Track_Delta'].apply(lambda x: 360 - x if x > 180 else x).fillna(0)
     df['Turn_Rate'] = (df['Track_Delta'] / df['Dt']).rolling(window=3).mean()
     
-    # --- ADVANCED AERODYNAMICS MATH ---
-    g = 32.174 # Gravity in ft/s^2
-    df['Vel_fps'] = df['GS'] * 1.68781 # Knots to ft/s
+    g = 32.174 
+    df['Vel_fps'] = df['GS'] * 1.68781 
     
-    # Bank Angle = atan( (Turn_Rate_Rad * Vel_fps) / g )
     turn_rate_rad = np.radians(df['Turn_Rate'])
     df['Bank_Angle'] = np.degrees(np.arctan((turn_rate_rad * df['Vel_fps']) / g)).fillna(0)
     
-    # G-Load = 1 / cos(Bank_Angle_Rad). Capped at 3G to filter GPS anomalies
     df['G_Load'] = (1 / np.cos(np.radians(df['Bank_Angle']))).clip(1, 3)
-    
-    # Specific Energy = Altitude + (Velocity^2 / 2g)
     df['Specific_Energy'] = df['Alt_Smooth'] + ((df['Vel_fps']**2) / (2 * g))
     
     return df
@@ -186,7 +184,6 @@ if uploaded:
                 entry_alt = mdata['Alt_Smooth'].iloc[0]
                 max_dev = max(mdata['Alt_Smooth'].max() - entry_alt, entry_alt - mdata['Alt_Smooth'].min())
                 
-                # Maneuver Detection Cap
                 if total_turn >= 750:
                     label = "EXTENDED CIRCLING / HOLD"
                     color = "#888888"
@@ -208,9 +205,36 @@ if uploaded:
                         st.write(f"`ESTIMATED WINDS ALOFT: {int(wind)} KTS`")
 
         st.markdown("### 🗺️ SPATIAL TELEMETRY & PHYSICS")
-        t1, t2, t3, t4 = st.tabs(["3D AIRWAY CORRIDOR", "2D TACTICAL MAP", "AERODYNAMICS", "APPROACH ENVELOPE"])
+        t1, t2, t3, t4 = st.tabs(["2D DYNAMIC MAP (NEW)", "3D AIRWAY CORRIDOR", "AERODYNAMICS", "APPROACH ENVELOPE"])
         
         with t1:
+            st.write("`SELECT AVIONICS OVERLAY METRIC:`")
+            
+            # --- THE DYNAMIC MAP SELECTOR ---
+            # Dictionary maps UI Label -> [DataFrame Column, Plotly Color Scale, Color Range]
+            map_metrics = {
+                "VERTICAL SPEED (FPM)": ["VSI", "RdBu_r", [-1000, 1000]],
+                "GROUNDSPEED (KTS)": ["GS", "Inferno", [df['GS'].min(), df['GS'].max()]],
+                "BANK ANGLE (°)": ["Bank_Angle", "Plasma", [0, 60]],
+                "G-LOAD (G)": ["G_Load", "Turbo", [1, 2]],
+                "TURN RATE (°/SEC)": ["Turn_Rate", "Plasma", [0, 4]],
+                "ALTITUDE (FT MSL)": ["Alt_Smooth", "Viridis", [df['Alt_Smooth'].min(), df['Alt_Smooth'].max()]],
+                "SPECIFIC ENERGY": ["Specific_Energy", "Cividis", [df['Specific_Energy'].min(), df['Specific_Energy'].max()]]
+            }
+            
+            selected_metric = st.selectbox("", list(map_metrics.keys()))
+            active_col, active_colorscale, active_range = map_metrics[selected_metric]
+            
+            fig_map = px.scatter_mapbox(
+                df, lat="Lat", lon="Lon", color=active_col,
+                color_continuous_scale=active_colorscale, range_color=active_range,
+                zoom=10, height=650, 
+                hover_data=["Alt_Smooth", "GS", "VSI", "Bank_Angle", "G_Load"]
+            )
+            fig_map.update_layout(mapbox_style="carto-darkmatter", template="plotly_dark", margin=dict(l=0,r=0,b=0,t=0))
+            st.plotly_chart(fig_map, use_container_width=True)
+
+        with t2:
             st.write("`USE SLIDERS TO CROP OUT TAXI, CLIMB, AND HOLDING PATTERN RUBBISH`")
             trim_start, trim_end = st.slider(
                 "SELECT PRACTICE AREA TIMEFRAME (MINUTES)", 
@@ -242,7 +266,7 @@ if uploaded:
                 ))
                 
                 fig_3d.update_layout(
-                    title="TRIMMED 3D TRAJECTORY",
+                    title="TRIMMED 3D TRAJECTORY (COLOR=SPEED)",
                     template="plotly_dark", 
                     height=700, 
                     margin=dict(l=0,r=0,b=0,t=40),
@@ -258,26 +282,14 @@ if uploaded:
             else:
                 st.warning("`WARNING: NO DATA REMAINS AFTER CURRENT CROP SELECTION.`")
 
-        with t2:
-            st.write("`COLOR CODED BY TURN RATE (HIGHLIGHTS GROUND REFERENCE MANEUVERS)`")
-            fig_map = px.scatter_mapbox(
-                df, lat="Lat", lon="Lon", color="Turn_Rate",
-                color_continuous_scale="Plasma", range_color=[0, 4],
-                zoom=10, height=600, hover_data=["Alt_Smooth", "Bank_Angle", "G_Load"]
-            )
-            fig_map.update_layout(mapbox_style="carto-darkmatter", template="plotly_dark", margin=dict(l=0,r=0,b=0,t=0))
-            st.plotly_chart(fig_map, use_container_width=True)
-
         with t3:
             st.write("`SPECIFIC ENERGY STATE & ESTIMATED BANK ANGLES`")
             fig_aero = go.Figure()
-            # Energy State
             fig_aero.add_trace(go.Scatter(x=df['Time'], y=df['Specific_Energy'], name="SPECIFIC ENERGY (FT)", line=dict(color="#FF9F1C", width=2)))
             fig_aero.add_trace(go.Scatter(x=df['Time'], y=df['Alt_Smooth'], name="POTENTIAL ENERGY (ALT)", line=dict(color="#00FF41", width=2, dash='dot')))
             fig_aero.update_layout(template="plotly_dark", xaxis_title="TIME (UTC)", yaxis_title="ENERGY STATE", height=400)
             st.plotly_chart(fig_aero, use_container_width=True)
             
-            # Bank & G-Load
             fig_bank = go.Figure()
             fig_bank.add_trace(go.Scatter(x=df['Time'], y=df['Bank_Angle'], name="ESTIMATED BANK (°)", line=dict(color="#00FFFF", width=2)))
             fig_bank.update_layout(template="plotly_dark", xaxis_title="TIME (UTC)", yaxis_title="BANK ANGLE", height=300)
@@ -285,7 +297,6 @@ if uploaded:
 
         with t4:
             st.write("`APPROACH ENVELOPE: VSI vs GROUNDSPEED (IDEAL APPROACH IS CLUSTERED)`")
-            # Filter to approach speeds and descents
             approach_df = df[(df['VSI'] < -100) & (df['GS'] < 100) & (df['Alt_Smooth'] < (field_elevation + 2000))]
             if not approach_df.empty:
                 fig_env = px.scatter(
