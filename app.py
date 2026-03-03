@@ -26,7 +26,6 @@ st.markdown("""
         color: #C0C0C0;
         font-family: 'JetBrains Mono', monospace;
     }
-    
     h1, h2, h3 {
         color: #FF9F1C !important; 
         text-transform: uppercase;
@@ -34,7 +33,6 @@ st.markdown("""
         border-bottom: 2px solid #1A1A1A;
         padding-bottom: 5px;
     }
-
     div[data-testid="metric-container"] {
         background-color: #0F0F0F;
         border: 1px solid #333333;
@@ -50,19 +48,16 @@ st.markdown("""
         color: #00FF41 !important; 
         font-weight: 700 !important;
     }
-
     .streamlit-expanderHeader {
         background-color: #0F0F0F !important;
         color: #FF9F1C !important;
         border: 1px solid #333333 !important;
         border-radius: 0px !important;
     }
-
     .stFileUploader {
         border: 1px dashed #FF9F1C;
         background-color: #0F0F0F;
     }
-
     div[data-testid="stNotification"] {
         background-color: #0F0F0F !important;
         border-radius: 0px !important;
@@ -116,6 +111,7 @@ def process_kml(file_content):
 
     df['Time'] = pd.to_datetime(df['Time'])
     df['Dt'] = df['Time'].diff().dt.total_seconds().fillna(1)
+    df['Cumulative_Min'] = df['Dt'].cumsum() / 60.0  # Added for the time slider
     
     df['Alt_Smooth'] = df['Alt_Raw'].rolling(window=7, center=True, min_periods=1).mean()
     df['VSI'] = (df['Alt_Smooth'].diff() / (df['Dt'] / 60.0)).fillna(0).rolling(5).mean()
@@ -152,7 +148,9 @@ if uploaded:
         col1.metric("PEAK ALTITUDE", f"{int(df['Alt_Smooth'].max())} FT MSL")
         col2.metric("MAX GROUNDSPEED", f"{int(df['GS'].max())} KTS")
         col3.metric("MAX SINK RATE", f"{int(df['VSI'].min())} FPM")
-        col4.metric("TOTAL SORTIE", f"{int(df['Dt'].sum()/60)} MIN")
+        
+        total_mins = int(df['Dt'].sum()/60)
+        col4.metric("TOTAL SORTIE", f"{total_mins} MIN")
 
         if metar:
             st.info(f"📍 **SURFACE WX ({metar.get('icaoId')}):** `{metar.get('rawOb')}`")
@@ -172,13 +170,23 @@ if uploaded:
                 entry_alt = mdata['Alt_Smooth'].iloc[0]
                 max_dev = max(mdata['Alt_Smooth'].max() - entry_alt, entry_alt - mdata['Alt_Smooth'].min())
                 
-                label = "360° STEEP TURN" if total_turn > 320 else "COURSE REVERSAL"
-                color = "#00FF41" if max_dev <= 50 else ("#FF9F1C" if max_dev <= 100 else "#FF0000")
-                status = "CPL GRADE" if max_dev <= 50 else ("PPL PASS" if max_dev <= 100 else "ACS BUST")
+                # BUG FIX: Cap the maneuver detection so it doesn't grade a 1000 degree holding pattern as a steep turn
+                if total_turn >= 750:
+                    label = "EXTENDED CIRCLING / HOLD"
+                    color = "#888888"
+                    status = "UNGRADED"
+                elif total_turn >= 320:
+                    label = "360° STEEP TURN"
+                    color = "#00FF41" if max_dev <= 50 else ("#FF9F1C" if max_dev <= 100 else "#FF0000")
+                    status = "CPL GRADE" if max_dev <= 50 else ("PPL PASS" if max_dev <= 100 else "ACS BUST")
+                else:
+                    label = "COURSE REVERSAL"
+                    color = "#00FF41" if max_dev <= 50 else ("#FF9F1C" if max_dev <= 100 else "#FF0000")
+                    status = "CPL GRADE" if max_dev <= 50 else ("PPL PASS" if max_dev <= 100 else "ACS BUST")
 
-                with st.expander(f"MNVR {found_mnvrs} | {label} | DEV: {int(max_dev)}FT"):
-                    st.markdown(f"**STATUS:** <span style='color:{color}'>{status}</span>", unsafe_allow_html=True)
-                    st.write(f"`ENTRY ALT: {int(entry_alt)} FT | DURATION: {int(duration)}s | TURN: {int(total_turn)}°`")
+                with st.expander(f"MNVR {found_mnvrs} | {label} | TURN: {int(total_turn)}°"):
+                    st.markdown(f"**STATUS:** <span style='color:{color}'>{status}</span> (DEV: {int(max_dev)}FT)", unsafe_allow_html=True)
+                    st.write(f"`ENTRY ALT: {int(entry_alt)} FT | DURATION: {int(duration)}s`")
                     if label == "360° STEEP TURN":
                         wind = (mdata['GS'].max() - mdata['GS'].min()) / 2
                         st.write(f"`ESTIMATED WINDS ALOFT: {int(wind)} KTS`")
@@ -187,46 +195,60 @@ if uploaded:
         t1, t2, t3 = st.tabs(["3D AIRWAY CORRIDOR", "TACTICAL MAP", "ALTITUDE PROFILE"])
         
         with t1:
-            # 1. THE AIRBORNE FILTER: Strip out the taxiway spaghetti
-            airborne_df = df[df['GS'] > 35]
-            
-            # 2. THE RIBBON UPGRADE: True 3D line instead of scatter dots
-            fig_3d = go.Figure(data=go.Scatter3d(
-                x=airborne_df['Lon'],
-                y=airborne_df['Lat'],
-                z=airborne_df['Alt_Smooth'],
-                mode='lines',
-                line=dict(
-                    color=airborne_df['GS'],
-                    colorscale='Inferno',
-                    width=6,
-                    colorbar=dict(title="KTS")
-                ),
-                text=[f"ALT: {alt:.0f} FT<br>GS: {gs:.0f} KTS" for alt, gs in zip(airborne_df['Alt_Smooth'], airborne_df['GS'])],
-                hoverinfo="text"
-            ))
-            
-            # 3. THE ASPECT RATIO FIX: Force the box to be wide and flat
-            fig_3d.update_layout(
-                title="3D TRAJECTORY (AIRBORNE ONLY)",
-                template="plotly_dark", 
-                height=700, 
-                margin=dict(l=0,r=0,b=0,t=40),
-                scene=dict(
-                    xaxis_title="LONGITUDE",
-                    yaxis_title="LATITUDE",
-                    zaxis_title="ALTITUDE (FT)",
-                    aspectmode='manual',
-                    aspectratio=dict(x=1, y=1, z=0.4) # Flattens the Z-axis distortion
-                )
+            st.write("`USE SLIDERS TO CROP OUT TAXI, CLIMB, AND HOLDING PATTERN RUBBISH`")
+            # 1. THE AIRWAY TRIMMER SLIDER
+            trim_start, trim_end = st.slider(
+                "SELECT PRACTICE AREA TIMEFRAME (MINUTES)", 
+                0, total_mins, (int(total_mins * 0.15), int(total_mins * 0.85))
             )
-            st.plotly_chart(fig_3d, use_container_width=True)
+            
+            # 2. THE AIRBORNE + TRIM + AUTO-FLOOR FILTER
+            field_elevation = df['Alt_Smooth'].min()
+            airborne_df = df[
+                (df['GS'] > 35) & 
+                (df['Alt_Smooth'] > (field_elevation + 200)) & # Clears the runway/pattern junk
+                (df['Cumulative_Min'] >= trim_start) & 
+                (df['Cumulative_Min'] <= trim_end)
+            ]
+            
+            if not airborne_df.empty:
+                fig_3d = go.Figure(data=go.Scatter3d(
+                    x=airborne_df['Lon'],
+                    y=airborne_df['Lat'],
+                    z=airborne_df['Alt_Smooth'],
+                    mode='lines',
+                    line=dict(
+                        color=airborne_df['GS'],
+                        colorscale='Inferno',
+                        width=6,
+                        colorbar=dict(title="KTS")
+                    ),
+                    text=[f"ALT: {alt:.0f} FT<br>GS: {gs:.0f} KTS" for alt, gs in zip(airborne_df['Alt_Smooth'], airborne_df['GS'])],
+                    hoverinfo="text"
+                ))
+                
+                fig_3d.update_layout(
+                    title="TRIMMED 3D TRAJECTORY",
+                    template="plotly_dark", 
+                    height=700, 
+                    margin=dict(l=0,r=0,b=0,t=40),
+                    scene=dict(
+                        xaxis_title="LONGITUDE",
+                        yaxis_title="LATITUDE",
+                        zaxis_title="ALTITUDE (FT)",
+                        aspectmode='manual',
+                        aspectratio=dict(x=1, y=1, z=0.4) 
+                    )
+                )
+                st.plotly_chart(fig_3d, use_container_width=True)
+            else:
+                st.warning("`WARNING: NO DATA REMAINS AFTER CURRENT CROP SELECTION.`")
 
         with t2:
             fig_map = px.scatter_mapbox(
                 df, lat="Lat", lon="Lon", color="VSI",
                 color_continuous_scale="RdBu_r", range_color=[-1000, 1000],
-                zoom=11, height=600
+                zoom=10, height=600
             )
             fig_map.update_layout(mapbox_style="carto-darkmatter", template="plotly_dark", margin=dict(l=0,r=0,b=0,t=0))
             st.plotly_chart(fig_map, use_container_width=True)
