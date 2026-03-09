@@ -166,6 +166,20 @@ if uploaded:
                     if "360°" in label:
                         wind = (mdata['GS'].max() - mdata['GS'].min()) / 2
                         st.write(f"`ESTIMATED WINDS ALOFT: {int(wind)} KTS`")
+                        
+                    # --- NEW: MINI MANEUVER MAP ---
+                    fig_mnvr = px.scatter_mapbox(
+                        mdata, lat="Lat", lon="Lon", color="Alt_Smooth",
+                        color_continuous_scale="Viridis",
+                        zoom=13.5, height=300
+                    )
+                    fig_mnvr.update_layout(
+                        mapbox_style="carto-darkmatter", 
+                        template="plotly_dark", 
+                        margin=dict(l=0,r=0,b=0,t=0),
+                        coloraxis_showscale=False # Hides the colorbar to save space
+                    )
+                    st.plotly_chart(fig_mnvr, use_container_width=True, key=f"map_{mid}_{found_mnvrs}")
 
         st.markdown("### 🗺️ SPATIAL TELEMETRY & PHYSICS")
         t1, t2, t3, t4 = st.tabs(["2D DYNAMIC MAP", "3D AIRWAY CORRIDOR", "AERODYNAMICS", "TOUCH & GO PROFILER"])
@@ -242,7 +256,6 @@ if uploaded:
         with t4:
             st.write("`TOUCH & GO DETECTOR: 90-SECOND GLIDEPATH ISOLATION`")
             
-            # Touchdown Logic: Detect crossing the 75ft AGL deck
             df['On_Ground'] = df['Alt_AGL'] < 75
             df['Touchdown_Trigger'] = (df['On_Ground'] == True) & (df['On_Ground'].shift(1) == False)
             touchdowns = df[df['Touchdown_Trigger']]
@@ -254,12 +267,10 @@ if uploaded:
                 fig_speed = go.Figure()
                 
                 for idx, (td_index, td_row) in enumerate(touchdowns.iterrows()):
-                    # Capture the 90 seconds prior to touchdown
                     start_time = td_row['Time'] - pd.Timedelta(seconds=90)
                     approach_data = df[(df['Time'] >= start_time) & (df['Time'] <= td_row['Time'])].copy()
                     
                     if len(approach_data) > 10:
-                        # Convert to negative seconds to touchdown
                         approach_data['Sec_To_TD'] = (approach_data['Time'] - td_row['Time']).dt.total_seconds()
                         app_name = f"APPROACH {idx+1}"
                         
