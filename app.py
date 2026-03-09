@@ -166,20 +166,25 @@ if uploaded:
                     if "360°" in label:
                         wind = (mdata['GS'].max() - mdata['GS'].min()) / 2
                         st.write(f"`ESTIMATED WINDS ALOFT: {int(wind)} KTS`")
-                        
-                    # --- NEW: MINI MANEUVER MAP ---
-                    fig_mnvr = px.scatter_mapbox(
-                        mdata, lat="Lat", lon="Lon", color="Alt_Smooth",
-                        color_continuous_scale="Viridis",
-                        zoom=13.5, height=300
+
+                    # --- FIX: THE MINI MANEUVER TRACK MAP ---
+                    fig_mnvr = px.line_mapbox(
+                        mdata, lat="Lat", lon="Lon", 
+                        zoom=14.5, height=300
                     )
+                    # Paint the line radar green
+                    fig_mnvr.update_traces(line=dict(color='#00FF41', width=4))
+                    
+                    # Force mathematical centering so the box doesn't glitch
                     fig_mnvr.update_layout(
                         mapbox_style="carto-darkmatter", 
                         template="plotly_dark", 
                         margin=dict(l=0,r=0,b=0,t=0),
-                        coloraxis_showscale=False # Hides the colorbar to save space
+                        mapbox=dict(
+                            center=dict(lat=mdata['Lat'].mean(), lon=mdata['Lon'].mean())
+                        )
                     )
-                    st.plotly_chart(fig_mnvr, use_container_width=True, key=f"map_{mid}_{found_mnvrs}")
+                    st.plotly_chart(fig_mnvr, use_container_width=True, key=f"mnvr_map_{mid}_{found_mnvrs}")
 
         st.markdown("### 🗺️ SPATIAL TELEMETRY & PHYSICS")
         t1, t2, t3, t4 = st.tabs(["2D DYNAMIC MAP", "3D AIRWAY CORRIDOR", "AERODYNAMICS", "TOUCH & GO PROFILER"])
@@ -233,10 +238,16 @@ if uploaded:
                 fig_3d.update_layout(
                     title="TRIMMED 3D TRAJECTORY (COLOR=SPEED)",
                     template="plotly_dark", height=700, margin=dict(l=0,r=0,b=0,t=40),
-                    dragmode='turntable',
                     scene=dict(xaxis_title="LONGITUDE", yaxis_title="LATITUDE", zaxis_title="ALTITUDE (FT)", aspectmode='manual', aspectratio=dict(x=1, y=1, z=0.4))
                 )
-                st.plotly_chart(fig_3d, use_container_width=True, config={'scrollZoom': True, 'displayModeBar': True})
+                
+                # Touch-Optimized iPad Configuration
+                st.plotly_chart(fig_3d, use_container_width=True, config={
+                    'scrollZoom': True, 
+                    'displayModeBar': True,
+                    'displaylogo': False,
+                    'modeBarButtonsToRemove': ['resetCameraDefault3d']
+                })
             else:
                 st.warning("`WARNING: NO DATA REMAINS AFTER CURRENT CROP SELECTION.`")
 
