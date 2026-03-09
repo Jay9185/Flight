@@ -21,53 +21,15 @@ st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap');
 
-    .stApp {
-        background-color: #050505;
-        color: #C0C0C0;
-        font-family: 'JetBrains Mono', monospace;
-    }
-    h1, h2, h3 {
-        color: #FF9F1C !important; 
-        text-transform: uppercase;
-        letter-spacing: 2px;
-        border-bottom: 2px solid #1A1A1A;
-        padding-bottom: 5px;
-    }
-    div[data-testid="metric-container"] {
-        background-color: #0F0F0F;
-        border: 1px solid #333333;
-        padding: 20px;
-        border-radius: 0px;
-        border-left: 5px solid #FF9F1C;
-    }
-    div[data-testid="metric-container"] label {
-        color: #888888 !important;
-        font-size: 0.8rem !important;
-    }
-    div[data-testid="metric-container"] div {
-        color: #00FF41 !important; 
-        font-weight: 700 !important;
-    }
-    .streamlit-expanderHeader {
-        background-color: #0F0F0F !important;
-        color: #FF9F1C !important;
-        border: 1px solid #333333 !important;
-        border-radius: 0px !important;
-    }
-    .stFileUploader {
-        border: 1px dashed #FF9F1C;
-        background-color: #0F0F0F;
-    }
-    div[data-testid="stNotification"] {
-        background-color: #0F0F0F !important;
-        border-radius: 0px !important;
-    }
-    /* Style the dropdowns to look like avionics menus */
-    div[data-baseweb="select"] > div {
-        background-color: #0F0F0F !important;
-        border: 1px solid #FF9F1C !important;
-        color: #00FF41 !important;
-    }
+    .stApp { background-color: #050505; color: #C0C0C0; font-family: 'JetBrains Mono', monospace; }
+    h1, h2, h3 { color: #FF9F1C !important; text-transform: uppercase; letter-spacing: 2px; border-bottom: 2px solid #1A1A1A; padding-bottom: 5px; }
+    div[data-testid="metric-container"] { background-color: #0F0F0F; border: 1px solid #333333; padding: 20px; border-radius: 0px; border-left: 5px solid #FF9F1C; }
+    div[data-testid="metric-container"] label { color: #888888 !important; font-size: 0.8rem !important; }
+    div[data-testid="metric-container"] div { color: #00FF41 !important; font-weight: 700 !important; }
+    .streamlit-expanderHeader { background-color: #0F0F0F !important; color: #FF9F1C !important; border: 1px solid #333333 !important; border-radius: 0px !important; }
+    .stFileUploader { border: 1px dashed #FF9F1C; background-color: #0F0F0F; }
+    div[data-testid="stNotification"] { background-color: #0F0F0F !important; border-radius: 0px !important; }
+    div[data-baseweb="select"] > div { background-color: #0F0F0F !important; border: 1px solid #FF9F1C !important; color: #00FF41 !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -91,8 +53,7 @@ def fetch_metar(lat, lon):
     try:
         url = f"https://aviationweather.gov/api/data/metar?lat={lat}&lon={lon}&distance=25&format=json"
         res = requests.get(url, timeout=5)
-        if res.status_code == 200 and res.json():
-            return res.json()[0]
+        if res.status_code == 200 and res.json(): return res.json()[0]
     except: return None
 
 # --- Core Data Pipeline ---
@@ -105,12 +66,7 @@ def process_kml(file_content):
     for t, c in zip(times, coords):
         c_parts = c.text.split()
         if len(c_parts) == 3:
-            data.append({
-                'Time': t.text.replace('Z', ''),
-                'Lon': float(c_parts[0]),
-                'Lat': float(c_parts[1]),
-                'Alt_Raw': float(c_parts[2]) * 3.28084 
-            })
+            data.append({'Time': t.text.replace('Z', ''), 'Lon': float(c_parts[0]), 'Lat': float(c_parts[1]), 'Alt_Raw': float(c_parts[2]) * 3.28084})
             
     df = pd.DataFrame(data)
     if df.empty: return df
@@ -121,6 +77,10 @@ def process_kml(file_content):
     
     df['Alt_Smooth'] = df['Alt_Raw'].rolling(window=7, center=True, min_periods=1).mean()
     df['VSI'] = (df['Alt_Smooth'].diff() / (df['Dt'] / 60.0)).fillna(0).rolling(5).mean()
+    
+    # Calculate Field Elevation & AGL
+    field_elev = df['Alt_Smooth'].min()
+    df['Alt_AGL'] = df['Alt_Smooth'] - field_elev
     
     dist, bear = [0], [0]
     for i in range(1, len(df)):
@@ -158,6 +118,7 @@ if uploaded:
     if not df.empty:
         metar = fetch_metar(df['Lat'].iloc[0], df['Lon'].iloc[0])
         total_mins = int(df['Dt'].sum()/60)
+        field_elevation = df['Alt_Smooth'].min()
         
         st.markdown("### 📡 INITIAL CONDITIONS & TELEMETRY")
         col1, col2, col3, col4 = st.columns(4)
@@ -179,47 +140,45 @@ if uploaded:
             total_turn = mdata['Track_Delta'].sum()
             duration = mdata['Dt'].sum()
             
-            if duration > 15 and total_turn > 150:
+            if duration > 15 and total_turn > 100:
                 found_mnvrs += 1
                 entry_alt = mdata['Alt_Smooth'].iloc[0]
                 max_dev = max(mdata['Alt_Smooth'].max() - entry_alt, entry_alt - mdata['Alt_Smooth'].min())
                 
-                if total_turn >= 750:
-                    label = "EXTENDED CIRCLING / HOLD"
-                    color = "#888888"
-                    status = "UNGRADED"
-                elif total_turn >= 320:
+                if total_turn >= 700:
+                    label, color, status = "EXTENDED CIRCLING / HOLD", "#888888", "UNGRADED"
+                elif 320 <= total_turn <= 400:
                     label = "360° STEEP TURN"
                     color = "#00FF41" if max_dev <= 50 else ("#FF9F1C" if max_dev <= 100 else "#FF0000")
                     status = "CPL GRADE" if max_dev <= 50 else ("PPL PASS" if max_dev <= 100 else "ACS BUST")
+                elif 150 <= total_turn <= 210:
+                    label = "180° COURSE REVERSAL"
+                    color = "#00FF41" if max_dev <= 50 else ("#FF9F1C" if max_dev <= 100 else "#FF0000")
+                    status = "CPL GRADE" if max_dev <= 50 else ("PPL PASS" if max_dev <= 100 else "ACS BUST")
                 else:
-                    label = "COURSE REVERSAL"
+                    label = "GROUND REFERENCE / S-TURNS"
                     color = "#00FF41" if max_dev <= 50 else ("#FF9F1C" if max_dev <= 100 else "#FF0000")
                     status = "CPL GRADE" if max_dev <= 50 else ("PPL PASS" if max_dev <= 100 else "ACS BUST")
 
                 with st.expander(f"MNVR {found_mnvrs} | {label} | TURN: {int(total_turn)}°"):
                     st.markdown(f"**STATUS:** <span style='color:{color}'>{status}</span> (DEV: {int(max_dev)}FT)", unsafe_allow_html=True)
                     st.write(f"`ENTRY ALT: {int(entry_alt)} FT | DURATION: {int(duration)}s | PEAK G: +{mdata['G_Load'].max():.1f}G`")
-                    if label == "360° STEEP TURN":
+                    if "360°" in label:
                         wind = (mdata['GS'].max() - mdata['GS'].min()) / 2
                         st.write(f"`ESTIMATED WINDS ALOFT: {int(wind)} KTS`")
 
         st.markdown("### 🗺️ SPATIAL TELEMETRY & PHYSICS")
-        t1, t2, t3, t4 = st.tabs(["2D DYNAMIC MAP (NEW)", "3D AIRWAY CORRIDOR", "AERODYNAMICS", "APPROACH ENVELOPE"])
+        t1, t2, t3, t4 = st.tabs(["2D DYNAMIC MAP", "3D AIRWAY CORRIDOR", "AERODYNAMICS", "TOUCH & GO PROFILER"])
         
         with t1:
             st.write("`SELECT AVIONICS OVERLAY METRIC:`")
-            
-            # --- THE DYNAMIC MAP SELECTOR ---
-            # Dictionary maps UI Label -> [DataFrame Column, Plotly Color Scale, Color Range]
             map_metrics = {
+                "ALTITUDE (AGL)": ["Alt_AGL", "Viridis", [0, 3000]],
                 "VERTICAL SPEED (FPM)": ["VSI", "RdBu_r", [-1000, 1000]],
                 "GROUNDSPEED (KTS)": ["GS", "Inferno", [df['GS'].min(), df['GS'].max()]],
                 "BANK ANGLE (°)": ["Bank_Angle", "Plasma", [0, 60]],
                 "G-LOAD (G)": ["G_Load", "Turbo", [1, 2]],
-                "TURN RATE (°/SEC)": ["Turn_Rate", "Plasma", [0, 4]],
-                "ALTITUDE (FT MSL)": ["Alt_Smooth", "Viridis", [df['Alt_Smooth'].min(), df['Alt_Smooth'].max()]],
-                "SPECIFIC ENERGY": ["Specific_Energy", "Cividis", [df['Specific_Energy'].min(), df['Specific_Energy'].max()]]
+                "TURN RATE (°/SEC)": ["Turn_Rate", "Plasma", [0, 4]]
             }
             
             selected_metric = st.selectbox("", list(map_metrics.keys()))
@@ -229,10 +188,10 @@ if uploaded:
                 df, lat="Lat", lon="Lon", color=active_col,
                 color_continuous_scale=active_colorscale, range_color=active_range,
                 zoom=10, height=650, 
-                hover_data=["Alt_Smooth", "GS", "VSI", "Bank_Angle", "G_Load"]
+                hover_data=["Alt_AGL", "GS", "VSI", "Bank_Angle"]
             )
             fig_map.update_layout(mapbox_style="carto-darkmatter", template="plotly_dark", margin=dict(l=0,r=0,b=0,t=0))
-            st.plotly_chart(fig_map, use_container_width=True)
+            st.plotly_chart(fig_map, use_container_width=True, config={'scrollZoom': True})
 
         with t2:
             st.write("`USE SLIDERS TO CROP OUT TAXI, CLIMB, AND HOLDING PATTERN RUBBISH`")
@@ -241,7 +200,6 @@ if uploaded:
                 0, total_mins, (int(total_mins * 0.15), int(total_mins * 0.85))
             )
             
-            field_elevation = df['Alt_Smooth'].min()
             airborne_df = df[
                 (df['GS'] > 35) & 
                 (df['Alt_Smooth'] > (field_elevation + 200)) & 
@@ -251,34 +209,20 @@ if uploaded:
             
             if not airborne_df.empty:
                 fig_3d = go.Figure(data=go.Scatter3d(
-                    x=airborne_df['Lon'],
-                    y=airborne_df['Lat'],
-                    z=airborne_df['Alt_Smooth'],
+                    x=airborne_df['Lon'], y=airborne_df['Lat'], z=airborne_df['Alt_Smooth'],
                     mode='lines',
-                    line=dict(
-                        color=airborne_df['GS'],
-                        colorscale='Inferno',
-                        width=6,
-                        colorbar=dict(title="KTS")
-                    ),
+                    line=dict(color=airborne_df['GS'], colorscale='Inferno', width=6, colorbar=dict(title="KTS")),
                     text=[f"ALT: {alt:.0f} FT<br>GS: {gs:.0f} KTS<br>BANK: {bk:.0f}°" for alt, gs, bk in zip(airborne_df['Alt_Smooth'], airborne_df['GS'], airborne_df['Bank_Angle'])],
                     hoverinfo="text"
                 ))
                 
                 fig_3d.update_layout(
                     title="TRIMMED 3D TRAJECTORY (COLOR=SPEED)",
-                    template="plotly_dark", 
-                    height=700, 
-                    margin=dict(l=0,r=0,b=0,t=40),
-                    scene=dict(
-                        xaxis_title="LONGITUDE",
-                        yaxis_title="LATITUDE",
-                        zaxis_title="ALTITUDE (FT)",
-                        aspectmode='manual',
-                        aspectratio=dict(x=1, y=1, z=0.4) 
-                    )
+                    template="plotly_dark", height=700, margin=dict(l=0,r=0,b=0,t=40),
+                    dragmode='turntable',
+                    scene=dict(xaxis_title="LONGITUDE", yaxis_title="LATITUDE", zaxis_title="ALTITUDE (FT)", aspectmode='manual', aspectratio=dict(x=1, y=1, z=0.4))
                 )
-                st.plotly_chart(fig_3d, use_container_width=True)
+                st.plotly_chart(fig_3d, use_container_width=True, config={'scrollZoom': True, 'displayModeBar': True})
             else:
                 st.warning("`WARNING: NO DATA REMAINS AFTER CURRENT CROP SELECTION.`")
 
@@ -288,22 +232,52 @@ if uploaded:
             fig_aero.add_trace(go.Scatter(x=df['Time'], y=df['Specific_Energy'], name="SPECIFIC ENERGY (FT)", line=dict(color="#FF9F1C", width=2)))
             fig_aero.add_trace(go.Scatter(x=df['Time'], y=df['Alt_Smooth'], name="POTENTIAL ENERGY (ALT)", line=dict(color="#00FF41", width=2, dash='dot')))
             fig_aero.update_layout(template="plotly_dark", xaxis_title="TIME (UTC)", yaxis_title="ENERGY STATE", height=400)
-            st.plotly_chart(fig_aero, use_container_width=True)
+            st.plotly_chart(fig_aero, use_container_width=True, config={'scrollZoom': True})
             
             fig_bank = go.Figure()
             fig_bank.add_trace(go.Scatter(x=df['Time'], y=df['Bank_Angle'], name="ESTIMATED BANK (°)", line=dict(color="#00FFFF", width=2)))
             fig_bank.update_layout(template="plotly_dark", xaxis_title="TIME (UTC)", yaxis_title="BANK ANGLE", height=300)
-            st.plotly_chart(fig_bank, use_container_width=True)
+            st.plotly_chart(fig_bank, use_container_width=True, config={'scrollZoom': True})
 
         with t4:
-            st.write("`APPROACH ENVELOPE: VSI vs GROUNDSPEED (IDEAL APPROACH IS CLUSTERED)`")
-            approach_df = df[(df['VSI'] < -100) & (df['GS'] < 100) & (df['Alt_Smooth'] < (field_elevation + 2000))]
-            if not approach_df.empty:
-                fig_env = px.scatter(
-                    approach_df, x="GS", y="VSI", color="Alt_Smooth", 
-                    color_continuous_scale="Viridis", title="STABILIZED APPROACH SCATTER"
+            st.write("`TOUCH & GO DETECTOR: 90-SECOND GLIDEPATH ISOLATION`")
+            
+            # Touchdown Logic: Detect crossing the 75ft AGL deck
+            df['On_Ground'] = df['Alt_AGL'] < 75
+            df['Touchdown_Trigger'] = (df['On_Ground'] == True) & (df['On_Ground'].shift(1) == False)
+            touchdowns = df[df['Touchdown_Trigger']]
+            
+            if not touchdowns.empty:
+                st.info(f"🛬 **DETECTED {len(touchdowns)} RUNWAY CONTACT(S)**")
+                
+                fig_glide = go.Figure()
+                fig_speed = go.Figure()
+                
+                for idx, (td_index, td_row) in enumerate(touchdowns.iterrows()):
+                    # Capture the 90 seconds prior to touchdown
+                    start_time = td_row['Time'] - pd.Timedelta(seconds=90)
+                    approach_data = df[(df['Time'] >= start_time) & (df['Time'] <= td_row['Time'])].copy()
+                    
+                    if len(approach_data) > 10:
+                        # Convert to negative seconds to touchdown
+                        approach_data['Sec_To_TD'] = (approach_data['Time'] - td_row['Time']).dt.total_seconds()
+                        app_name = f"APPROACH {idx+1}"
+                        
+                        fig_glide.add_trace(go.Scatter(x=approach_data['Sec_To_TD'], y=approach_data['Alt_AGL'], mode='lines', name=app_name, line=dict(width=3)))
+                        fig_speed.add_trace(go.Scatter(x=approach_data['Sec_To_TD'], y=approach_data['GS'], mode='lines', name=app_name, line=dict(width=3)))
+
+                fig_glide.update_layout(
+                    template="plotly_dark", title="GLIDEPATH PROFILE (AGL)", 
+                    xaxis_title="SECONDS TO TOUCHDOWN", yaxis_title="ALTITUDE (FT AGL)", 
+                    hovermode="x unified", height=400
                 )
-                fig_env.update_layout(template="plotly_dark", height=600)
-                st.plotly_chart(fig_env, use_container_width=True)
+                fig_speed.update_layout(
+                    template="plotly_dark", title="AIRSPEED DECAY PROFILE", 
+                    xaxis_title="SECONDS TO TOUCHDOWN", yaxis_title="GROUNDSPEED (KTS)", 
+                    hovermode="x unified", height=300
+                )
+                
+                st.plotly_chart(fig_glide, use_container_width=True, config={'scrollZoom': True})
+                st.plotly_chart(fig_speed, use_container_width=True, config={'scrollZoom': True})
             else:
-                st.info("`NO APPROACH DATA DETECTED IN LOG.`")
+                st.warning("`NO RUNWAY CONTACT DETECTED IN LOG.`")
