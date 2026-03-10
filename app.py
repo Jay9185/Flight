@@ -6,7 +6,6 @@ import plotly.express as px
 import plotly.graph_objects as go
 import math
 import requests
-from datetime import datetime
 
 # ─────────────────────────────────────────────
 # UI CONFIGURATION
@@ -52,9 +51,7 @@ STALL_SPEED_KTS        = 55      # kts GS — stall detection threshold
 STALL_VSI_THRESH       = -300    # fpm — minimum sink rate to flag as stall entry
 EMERG_DESCENT_VSI      = -1500   # fpm — threshold for emergency descent detection
 EMERG_DESCENT_MIN_S    = 10      # seconds — minimum duration to log an ED event
-PATTERN_ALT_AGL        = 800     # ft AGL — nominal pattern altitude
-PATTERN_WINDOW_MIN     = 25      # minutes — how far back to look for pattern legs
-PATTERN_HDG_TOL_DEG    = 25      # degrees — heading tolerance for leg matching
+PATTERN_ALT_AGL        = 800     # ft AGL — nominal pattern altitude (user-adjustable in Tab 8)
 NAVAID_RADIUS_NM       = 40      # nm — radius for airport/navaid fetch
 
 # ─────────────────────────────────────────────
@@ -456,7 +453,7 @@ def detect_pattern_legs(df, td_row, pattern_alt_agl=PATTERN_ALT_AGL, right_hand=
 
     legs = {}
     for leg_name, exp_hdg in leg_headings.items():
-        mask     = airborne['Track'].apply(lambda t: heading_diff(t, exp_hdg)) < HDG_TOL
+        mask     = airborne['Track'].apply(lambda hdg: heading_diff(hdg, exp_hdg)) < HDG_TOL
         leg_data = airborne[mask]
         if not leg_data.empty and leg_data['Dt'].sum() > 5:
             legs[leg_name] = leg_data
@@ -498,7 +495,9 @@ if uploaded:
         st.warning("No data found in file.")
         st.stop()
 
-    metar          = fetch_metar(df['Lat'].iloc[0], df['Lon'].iloc[0])
+    # Use median position for METAR — more representative than first point on
+    # cross-country flights that land somewhere other than departure.
+    metar          = fetch_metar(df['Lat'].median(), df['Lon'].median())
     total_mins     = int(df['Dt'].sum() / 60)
     field_elevation = df['Alt_Smooth'].quantile(ALT_PERCENTILE_FIELD)
 
@@ -550,13 +549,13 @@ if uploaded:
             label, color, status = "EXTENDED CIRCLING / HOLD", "#888888", "UNGRADED"
         elif 320 <= total_turn <= 400:
             label  = "360° STEEP TURN"
-            color, status = acs_status_color(max_dev, 100, 50)[:2]
+            color, status = acs_status_color(max_dev, 100, 50)
         elif 150 <= total_turn <= 210:
             label  = "180° COURSE REVERSAL"
-            color, status = acs_status_color(max_dev, 100, 50)[:2]
+            color, status = acs_status_color(max_dev, 100, 50)
         else:
             label  = "GROUND REFERENCE / S-TURNS"
-            color, status = acs_status_color(max_dev, 100, 50)[:2]
+            color, status = acs_status_color(max_dev, 100, 50)
 
         # Grade and store
         grade_rows = grade_maneuver(label, row, mdata)
@@ -586,6 +585,14 @@ if uploaded:
             )
             st.plotly_chart(fig_mnvr, use_container_width=True, key=f"mnvr_map_{row['Maneuver_ID']}_{found_mnvrs}")
 
+    if found_mnvrs == 0:
+        st.info("`NO GRADABLE MANEUVERS DETECTED — minimum 15s duration and 100° heading sweep required`")
+
+    # ── Pre-compute touchdown data once (used by Tab 4 and Tab 8) ──────────
+    df['On_Ground']         = df['Alt_AGL'] < AGL_TOUCHDOWN_FT
+    df['Touchdown_Trigger'] = (df['On_Ground'] == True) & (df['On_Ground'].shift(1) == False)
+    touchdowns_all          = df[df['Touchdown_Trigger']]
+
     # ── TABS ─────────────────────────────────
     st.markdown("### 🗺️ SPATIAL TELEMETRY, PHYSICS & ADVANCED ANALYSIS")
     t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs([
@@ -602,10 +609,12 @@ if uploaded:
     # ── TAB 1: 2D MAP ──────────────────────────
     with t1:
         st.write("`SELECT AVIONICS OVERLAY METRIC:`")
+        gs_flying = df.loc[df['GS'] > GS_TAXI_THRESHOLD, 'GS']
+        gs_range  = [gs_flying.quantile(0.05), gs_flying.quantile(0.99)] if not gs_flying.empty else [0, df['GS'].max()]
         map_metrics = {
             "ALTITUDE (AGL)":       ["Alt_AGL",    "Viridis", [0, 3000]],
             "VERTICAL SPEED (FPM)": ["VSI",        "RdBu_r",  [-1000, 1000]],
-            "GROUNDSPEED (KTS)":    ["GS",         "Inferno", [df['GS'].min(), df['GS'].max()]],
+            "GROUNDSPEED (KTS)":    ["GS",         "Inferno", gs_range],
             "BANK ANGLE (°)":       ["Bank_Angle", "Plasma",  [0, 60]],
             "G-LOAD (G)":           ["G_Load",     "Turbo",   [1, 2]],
             "TURN RATE (°/SEC)":    ["Turn_Rate",  "Plasma",  [0, 4]],
@@ -726,9 +735,7 @@ if uploaded:
     # ── TAB 4: TOUCH & GO ─────────────────────
     with t4:
         st.write("`TOUCH & GO DETECTOR: 90-SECOND GLIDEPATH ISOLATION`")
-        df['On_Ground']         = df['Alt_AGL'] < AGL_TOUCHDOWN_FT
-        df['Touchdown_Trigger'] = (df['On_Ground'] == True) & (df['On_Ground'].shift(1) == False)
-        touchdowns = df[df['Touchdown_Trigger']]
+        touchdowns = touchdowns_all
 
         if not touchdowns.empty:
             st.info(f"🛬 **DETECTED {len(touchdowns)} RUNWAY CONTACT(S)**")
@@ -836,10 +843,11 @@ if uploaded:
                     fig_stall.add_trace(go.Scatter(x=edata['Time'], y=edata['VSI'],         name="VSI (FPM)",   line=dict(color="#00FFFF", width=1, dash='dot'), yaxis="y3"))
                     fig_stall.update_layout(
                         template="plotly_dark", height=350,
-                        xaxis_title="TIME (UTC)",
+                        xaxis=dict(title="TIME (UTC)", domain=[0, 0.82]),
                         yaxis=dict(title="ALT (FT)", color="#00FF41"),
                         yaxis2=dict(title="GS (KTS)", overlaying='y', side='right', color="#FF9F1C"),
-                        yaxis3=dict(title="VSI (FPM)", overlaying='y', side='right', position=0.85, color="#00FFFF"),
+                        yaxis3=dict(title="VSI (FPM)", overlaying='y', side='right',
+                                    anchor='free', position=0.92, color="#00FFFF"),
                         legend=dict(bgcolor='rgba(0,0,0,0)')
                     )
                     st.plotly_chart(fig_stall, use_container_width=True, config={'scrollZoom': True})
@@ -892,10 +900,12 @@ if uploaded:
                     fig_ed.add_trace(go.Scatter(x=edata['Time'], y=edata['VSI'],     name="VSI (FPM)",   line=dict(color="#FF4444", width=2), yaxis="y2"))
                     fig_ed.add_trace(go.Scatter(x=edata['Time'], y=edata['GS'],      name="GS (KTS)",    line=dict(color="#FF9F1C", width=1.5, dash='dot'), yaxis="y3"))
                     fig_ed.update_layout(
-                        template="plotly_dark", height=350, xaxis_title="TIME (UTC)",
+                        template="plotly_dark", height=350,
+                        xaxis=dict(title="TIME (UTC)", domain=[0, 0.82]),
                         yaxis=dict(title="ALT AGL (FT)", color="#00FF41"),
                         yaxis2=dict(title="VSI (FPM)", overlaying='y', side='right', color="#FF4444"),
-                        yaxis3=dict(title="GS (KTS)", overlaying='y', side='right', position=0.85, color="#FF9F1C"),
+                        yaxis3=dict(title="GS (KTS)", overlaying='y', side='right',
+                                    anchor='free', position=0.92, color="#FF9F1C"),
                         legend=dict(bgcolor='rgba(0,0,0,0)')
                     )
                     st.plotly_chart(fig_ed, use_container_width=True, config={'scrollZoom': True})
@@ -913,10 +923,7 @@ if uploaded:
     # ── TAB 8: PATTERN WORK GRADER ────────────
     with t8:
         st.write("`PATTERN WORK GRADER — AUTO-DETECTS RECTANGULAR TRAFFIC PATTERN LEGS FROM TOUCHDOWN EVENTS`")
-
-        df['On_Ground']         = df['Alt_AGL'] < AGL_TOUCHDOWN_FT
-        df['Touchdown_Trigger'] = (df['On_Ground'] == True) & (df['On_Ground'].shift(1) == False)
-        touchdowns = df[df['Touchdown_Trigger']]
+        touchdowns = touchdowns_all
 
         if touchdowns.empty:
             st.warning("`NO RUNWAY CONTACTS DETECTED — PATTERN ANALYSIS REQUIRES AT LEAST ONE TOUCHDOWN`")
@@ -965,7 +972,7 @@ if uploaded:
                                 grade_str = f"{grade} ({int(dev)} FT DEV)"
                             elif leg_name == "FINAL":
                                 exp_hdg   = runway_hdg
-                                hdg_err   = leg_data['Track'].apply(lambda t: heading_diff(t, exp_hdg)).mean()
+                                hdg_err   = leg_data['Track'].apply(lambda hdg: heading_diff(hdg, exp_hdg)).mean()
                                 color, grade = acs_status_color(hdg_err, 10, 5)
                                 grade_str = f"{grade} ({hdg_err:.1f}° HDG ERR)"
                             else:
@@ -1003,12 +1010,13 @@ if uploaded:
                             marker=dict(size=4),
                             name=leg_name,
                         ))
-                    all_lats = [r['Lat'] for leg in legs.values() for _, r in leg.iterrows()]
-                    all_lons = [r['Lon'] for leg in legs.values() for _, r in leg.iterrows()]
+                    all_points  = pd.concat(legs.values())
+                    center_lat  = all_points['Lat'].mean()
+                    center_lon  = all_points['Lon'].mean()
                     fig_pat.update_layout(
                         mapbox=dict(
                             style="carto-darkmatter",
-                            center=dict(lat=np.mean(all_lats), lon=np.mean(all_lons)),
+                            center=dict(lat=center_lat, lon=center_lon),
                             zoom=13
                         ),
                         template="plotly_dark",
