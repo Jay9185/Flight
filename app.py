@@ -400,56 +400,66 @@ def detect_emergency_descents(df):
 # ─────────────────────────────────────────────
 def detect_pattern_legs(df, td_row, pattern_alt_agl=PATTERN_ALT_AGL):
     """
-    Given a touchdown row, reverse-engineer the traffic pattern.
-    Returns (legs_dict, runway_heading) where legs_dict maps leg name → DataFrame.
-    """
-    td_time       = td_row['Time']
-    pattern_start = td_time - pd.Timedelta(minutes=PATTERN_WINDOW_MIN)
-    window        = df[(df['Time'] >= pattern_start) & (df['Time'] <= td_time)].copy()
+    Isolate a single circuit by finding the most recent departure (ground→airborne
+    transition) before this touchdown, then match leg headings within that window.
 
-    # Runway heading: median track in the last 60 s before touchdown
-    final_window = window[window['Time'] >= td_time - pd.Timedelta(seconds=60)]
-    if final_window.empty:
+    Key design decisions vs. original:
+    - NO altitude band filter: final/base descend below any sensible floor, so we
+      detect legs by heading only and report whatever altitude the aircraft was at.
+    - Circuit boundary: departure→touchdown, not a fixed 25-min lookback, so
+      overlapping circuits don't bleed heading data into each other.
+    - Runway heading computed from last 45 s while still FLYING (GS > threshold),
+      excluding slow flare/rollout rows.
+    - Heading tolerance widened to 35° to survive GPS track noise.
+    """
+    td_time = td_row['Time']
+
+    # ── Find circuit start: most recent liftoff before this touchdown ──
+    df_before = df[df['Time'] < td_time].copy()
+    df_before['_on_gnd']    = df_before['Alt_AGL'] < AGL_TOUCHDOWN_FT
+    df_before['_departure'] = (df_before['_on_gnd'] == False) & \
+                               (df_before['_on_gnd'].shift(1) == True)
+    departures = df_before[df_before['_departure']]
+
+    if not departures.empty:
+        circuit_start = departures['Time'].iloc[-1]
+    else:
+        # No departure detected (first circuit, or log starts airborne)
+        circuit_start = td_time - pd.Timedelta(minutes=20)
+
+    window = df[(df['Time'] >= circuit_start) & (df['Time'] <= td_time)].copy()
+
+    # ── Airborne-only slice: speed gate + minimum AGL ──
+    airborne = window[(window['GS'] > MIN_AIRSPEED_KTS) & (window['Alt_AGL'] > 50)]
+    if airborne.empty or len(airborne) < 10:
         return {}, None
 
-    runway_hdg = final_window['Track'].median() % 360
+    # ── Runway heading: median track in last 45 s while still flying ──
+    final_flying = airborne[airborne['Time'] >= td_time - pd.Timedelta(seconds=45)]
+    if final_flying.empty:
+        return {}, None
+    runway_hdg = final_flying['Track'].median() % 360
 
-    # Left-hand pattern leg headings
+    # ── Left-hand pattern leg headings ──
     leg_headings = {
-        "FINAL":     runway_hdg,
-        "BASE":      (runway_hdg + 90)  % 360,
-        "DOWNWIND":  (runway_hdg + 180) % 360,
-        "CROSSWIND": (runway_hdg + 270) % 360,
+        "CROSSWIND": (runway_hdg + 270) % 360,   # first 90° left turn after takeoff
+        "DOWNWIND":  (runway_hdg + 180) % 360,   # opposite runway direction
+        "BASE":      (runway_hdg + 90)  % 360,   # turn toward runway
+        "FINAL":     runway_hdg,                  # aligned with runway
     }
 
-    # Restrict to pattern altitude band and flying speed
-    pattern_band = window[
-        (window['Alt_AGL'] > pattern_alt_agl - 350) &
-        (window['Alt_AGL'] < pattern_alt_agl + 350) &
-        (window['GS'] > MIN_AIRSPEED_KTS)
-    ]
+    HDG_TOL = 35  # degrees — wide enough for GPS noise, narrow enough to be meaningful
 
     legs = {}
     for leg_name, exp_hdg in leg_headings.items():
-        mask     = pattern_band['Track'].apply(lambda t: heading_diff(t, exp_hdg)) < PATTERN_HDG_TOL_DEG
-        leg_data = pattern_band[mask]
+        mask     = airborne['Track'].apply(lambda t: heading_diff(t, exp_hdg)) < HDG_TOL
+        leg_data = airborne[mask]
         if not leg_data.empty and leg_data['Dt'].sum() > 5:
             legs[leg_name] = leg_data
 
     return legs, runway_hdg
 
-def grade_pattern_leg(leg_name, leg_data, runway_hdg, pattern_alt_agl):
-    """Grade a single pattern leg against ACS standards."""
-    alt_dev = leg_data['Alt_AGL'].std()  # consistency of altitude hold on leg
-    if leg_name == "DOWNWIND":
-        # Grade altitude hold on downwind — most graded leg
-        avg_alt = leg_data['Alt_AGL'].mean()
-        dev_from_pattern = abs(avg_alt - pattern_alt_agl)
-        return {"Altitude Dev from Pattern": dev_from_pattern, "Avg AGL": avg_alt}
-    if leg_name == "FINAL":
-        avg_hdg_err = leg_data['Track'].apply(lambda t: heading_diff(t, runway_hdg)).mean()
-        return {"Heading Error on Final": avg_hdg_err, "Avg AGL": leg_data['Alt_AGL'].mean()}
-    return {"Altitude Consistency (σ)": alt_dev, "Avg AGL": leg_data['Alt_AGL'].mean()}
+
 
 # ─────────────────────────────────────────────
 # UI HELPERS
