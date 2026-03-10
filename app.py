@@ -220,7 +220,15 @@ def process_kml(file_content):
 
     df['Track_Delta'] = df['Track'].diff().abs()
     df['Track_Delta'] = df['Track_Delta'].apply(lambda x: 360 - x if x > 180 else x).fillna(0)
-    df['Turn_Rate']   = (df['Track_Delta'] / dt_safe).rolling(window=3).mean().fillna(0)
+
+    # Signed heading change: positive = right/clockwise, negative = left/counterclockwise
+    # Normalised to [-180, 180] per step so wrap-arounds don't corrupt the sign.
+    raw_delta = df['Track'].diff()
+    df['Track_Delta_Signed'] = raw_delta.apply(
+        lambda x: ((x + 180) % 360) - 180 if pd.notna(x) else 0
+    ).fillna(0)
+
+    df['Turn_Rate'] = (df['Track_Delta'] / dt_safe).rolling(window=3).mean().fillna(0)
 
     g              = 32.174
     df['Vel_fps']  = df['GS'] * 1.68781
@@ -262,13 +270,13 @@ def grade_maneuver(label, row, mdata):
             "_cpl_pass":  cpl_pass,
         })
 
-    std_key = "360° STEEP TURN" if "360°" in label else \
-              "180° COURSE REVERSAL" if "180°" in label else \
+    std_key = "360° STEEP TURN"       if "360° STEEP TURN" in label else \
+              "180° COURSE REVERSAL"  if "180° COURSE REVERSAL" in label else \
               "GROUND REFERENCE / S-TURNS"
 
     add("Altitude Deviation", max_dev, std_key)
 
-    if "360°" in label:
+    if "360° STEEP TURN" in label:
         avg_bank = mdata['Bank_Angle'].median()
         bank_dev = abs(avg_bank - 45)
         add("Bank Dev from 45°", bank_dev, std_key)
@@ -278,7 +286,7 @@ def grade_maneuver(label, row, mdata):
         hdg_err     = heading_diff(entry_track, exit_track)
         add("Rollout Heading Error", hdg_err, std_key)
 
-    elif "180°" in label:
+    elif "180° COURSE REVERSAL" in label:
         entry_track   = mdata['Track'].iloc[0]
         exit_track    = mdata['Track'].iloc[-1]
         expected_exit = (entry_track + 180) % 360
@@ -463,8 +471,85 @@ def detect_pattern_legs(df, td_row, pattern_alt_agl=PATTERN_ALT_AGL, right_hand=
 
 
 # ─────────────────────────────────────────────
-# UI HELPERS
+# MANEUVER CLASSIFIER
 # ─────────────────────────────────────────────
+def classify_maneuver(row):
+    """
+    Multi-factor maneuver classifier. Returns (label, is_gradeable, caveats_list).
+
+    Old approach: bucket purely on total_turn degree ranges.
+    Problem: total_turn is the SUM OF ABSOLUTE heading deltas — a winding path
+    accumulates large values even if the aircraft never actually circles.
+
+    New approach:
+      - net_turn  = signed sum of heading deltas → actual net heading swept
+      - total_turn = absolute sum → how much turning was done regardless of direction
+      - consistency = |net| / total → 1.0 = clean single-direction, 0.0 = pure S-turn
+
+    Each maneuver type requires ALL of its gates to pass.
+    Anything that doesn't meet a clear threshold gets labelled honestly
+    as UNCLASSIFIED rather than force-fitted to a misleading name.
+    """
+    total     = row['total_turn']
+    net       = row['net_turn']
+    abs_net   = abs(net)
+    duration  = row['duration']
+    max_bank  = row['max_bank']
+    mean_agl  = row['mean_agl']
+    consistency = abs_net / total if total > 0 else 0
+    direction   = "RIGHT" if net > 0 else "LEFT"
+
+    caveats = []
+
+    # ── EXTENDED CIRCLING / HOLD ────────────────────────────────────────
+    # High total turn but near-zero consistency = back-and-forth = circling/holding.
+    if total >= 700 and consistency < 0.20:
+        return "EXTENDED CIRCLING / HOLD", False, []
+
+    # ── 360° STEEP TURN ─────────────────────────────────────────────────
+    # Must be one clean circle (consistency ≥ 0.80), net heading swept
+    # 300–420°, AND bank must actually be steep (≥ 40°).
+    if consistency >= 0.80 and 300 <= abs_net <= 420:
+        if max_bank >= 40:
+            return f"360° STEEP TURN ({direction})", True, caveats
+        else:
+            # Circle confirmed but bank is shallow — label honestly
+            caveats.append(f"MAX BANK {max_bank:.0f}° — ACS requires 45°, not graded as steep turn")
+            return f"360° TURN SHALLOW BANK ({direction})", False, caveats
+
+    # ── 180° COURSE REVERSAL ────────────────────────────────────────────
+    # Single clean reversal: consistency ≥ 0.75, net heading 145–215°.
+    if consistency >= 0.75 and 145 <= abs_net <= 215:
+        return f"180° COURSE REVERSAL ({direction})", True, caveats
+
+    # ── S-TURNS / GROUND REFERENCE ──────────────────────────────────────
+    # Low consistency (alternating turns) AND low altitude.
+    # High altitude with low consistency is just maneuvering, not ground ref.
+    if consistency < 0.40 and total >= 150:
+        if mean_agl <= 1500:
+            return "S-TURNS / GROUND REFERENCE", True, caveats
+        else:
+            caveats.append(f"MEAN ALT {mean_agl:.0f}ft AGL — ground reference is flown below 1500ft AGL")
+            return "MANEUVERING (HIGH ALT S-TURN)", False, caveats
+
+    # ── PARTIAL STEEP TURN ──────────────────────────────────────────────
+    # High consistency, significant sweep, but not a full circle.
+    # Could be an aborted steep turn, chandelle entry, or spiral.
+    if consistency >= 0.75 and 215 < abs_net < 300 and max_bank >= 40:
+        caveats.append(f"NET TURN {abs_net:.0f}° — not a complete circle, cannot grade as 360°")
+        return f"PARTIAL STEEP TURN ({direction})", False, caveats
+
+    # ── HIGH-ALT SINGLE DIRECTION TURN ─────────────────────────────────
+    # Consistent single-direction but doesn't fit any standard maneuver shape.
+    if consistency >= 0.75 and abs_net > 80:
+        caveats.append(f"NET {abs_net:.0f}°, BANK {max_bank:.0f}° — does not match any ACS maneuver profile")
+        return f"TURN {abs_net:.0f}° ({direction})", False, caveats
+
+    # ── CATCH-ALL ───────────────────────────────────────────────────────
+    caveats.append(f"CONSISTENCY {consistency:.2f}, NET {abs_net:.0f}° — mixed direction, no clear maneuver type")
+    return "UNCLASSIFIED MANEUVERING", False, caveats
+
+
 def acs_status_color(value, ppl_tol, cpl_tol, lower_better=True):
     if lower_better:
         if value <= cpl_tol: return "#00FF41", "CPL GRADE"
@@ -520,14 +605,18 @@ if uploaded:
 
     maneuver_df  = df[df['In_Maneuver']]
     maneuver_agg = maneuver_df.groupby('Maneuver_ID').agg(
-        total_turn=('Track_Delta', 'sum'),
-        duration=  ('Dt',          'sum'),
-        entry_alt= ('Alt_Smooth',  'first'),
-        alt_max=   ('Alt_Smooth',  'max'),
-        alt_min=   ('Alt_Smooth',  'min'),
-        peak_g=    ('G_Load',      'max'),
-        gs_max=    ('GS',          'max'),
-        gs_min=    ('GS',          'min'),
+        total_turn=('Track_Delta',        'sum'),
+        net_turn=  ('Track_Delta_Signed', 'sum'),   # signed: + = right, - = left
+        duration=  ('Dt',                 'sum'),
+        entry_alt= ('Alt_Smooth',         'first'),
+        alt_max=   ('Alt_Smooth',         'max'),
+        alt_min=   ('Alt_Smooth',         'min'),
+        peak_g=    ('G_Load',             'max'),
+        gs_max=    ('GS',                 'max'),
+        gs_min=    ('GS',                 'min'),
+        mean_bank= ('Bank_Angle',         'mean'),
+        max_bank=  ('Bank_Angle',         'max'),
+        mean_agl=  ('Alt_AGL',            'mean'),
     ).reset_index()
 
     # Store graded maneuvers for ACS panel
@@ -541,43 +630,58 @@ if uploaded:
             continue
 
         found_mnvrs += 1
-        entry_alt = row['entry_alt']
-        max_dev   = max(row['alt_max'] - entry_alt, entry_alt - row['alt_min'])
-        mdata     = maneuver_df[maneuver_df['Maneuver_ID'] == row['Maneuver_ID']]
+        entry_alt  = row['entry_alt']
+        max_dev    = max(row['alt_max'] - entry_alt, entry_alt - row['alt_min'])
+        mdata      = maneuver_df[maneuver_df['Maneuver_ID'] == row['Maneuver_ID']]
 
-        if total_turn >= 700:
-            label, color, status = "EXTENDED CIRCLING / HOLD", "#888888", "UNGRADED"
-        elif 320 <= total_turn <= 400:
-            label  = "360° STEEP TURN"
+        label, is_gradeable, caveats = classify_maneuver(row)
+
+        if not is_gradeable:
+            color, status = "#888888", "UNGRADED"
+        elif "360°" in label:
             color, status = acs_status_color(max_dev, 100, 50)
-        elif 150 <= total_turn <= 210:
-            label  = "180° COURSE REVERSAL"
+        elif "180°" in label:
             color, status = acs_status_color(max_dev, 100, 50)
         else:
-            label  = "GROUND REFERENCE / S-TURNS"
             color, status = acs_status_color(max_dev, 100, 50)
 
-        # Grade and store
-        grade_rows = grade_maneuver(label, row, mdata)
+        # Grade and store (only for labelled gradeable maneuvers)
+        grade_rows = grade_maneuver(label, row, mdata) if is_gradeable else []
         all_graded_maneuvers.append({
             'id': found_mnvrs, 'label': label, 'color': color, 'status': status,
             'total_turn': total_turn, 'row': row, 'mdata': mdata,
-            'grade_rows': grade_rows, 'max_dev': max_dev
+            'grade_rows': grade_rows, 'max_dev': max_dev,
+            'is_gradeable': is_gradeable, 'caveats': caveats,
         })
 
-        with st.expander(f"MNVR {found_mnvrs} | {label} | TURN: {int(total_turn)}°"):
-            st.markdown(
-                f"**STATUS:** <span style='color:{color}'>{status}</span> (DEV: {int(max_dev)}FT)",
-                unsafe_allow_html=True
-            )
-            st.write(f"`ENTRY ALT: {int(entry_alt)} FT | DURATION: {int(duration)}s | PEAK G: +{row['peak_g']:.1f}G`")
+        consistency = abs(row['net_turn']) / total_turn if total_turn > 0 else 0
 
-            if "360°" in label:
+        with st.expander(f"MNVR {found_mnvrs} | {label} | NET: {abs(row['net_turn']):.0f}°"):
+            col_s, col_b = st.columns([3, 1])
+            with col_s:
+                st.markdown(
+                    f"**STATUS:** <span style='color:{color}'>{status}</span>"
+                    + (f" — ALT DEV: {int(max_dev)} FT" if is_gradeable else ""),
+                    unsafe_allow_html=True
+                )
+                st.write(
+                    f"`ENTRY: {int(entry_alt)} FT MSL | DUR: {int(duration)}s | "
+                    f"PEAK G: +{row['peak_g']:.1f}G | MAX BANK: {row['max_bank']:.0f}° | "
+                    f"CONSISTENCY: {consistency:.2f}`"
+                )
+                for caveat in caveats:
+                    st.warning(f"⚠️ {caveat}")
+            with col_b:
+                st.metric("NET TURN",   f"{abs(row['net_turn']):.0f}°")
+                st.metric("TOTAL TURN", f"{total_turn:.0f}°")
+                st.metric("MAX BANK",   f"{row['max_bank']:.0f}°")
+
+            if "360°" in label and is_gradeable:
                 wind_est = (row['gs_max'] - row['gs_min']) / 2
                 st.write(f"`~EST WINDS ALOFT: {int(wind_est)} KTS (valid only for complete circular turns)`")
 
             fig_mnvr = px.line_mapbox(mdata, lat="Lat", lon="Lon", zoom=14.5, height=300)
-            fig_mnvr.update_traces(line=dict(color='#00FF41', width=4))
+            fig_mnvr.update_traces(line=dict(color=color if is_gradeable else '#888888', width=4))
             fig_mnvr.update_layout(
                 mapbox_style="carto-darkmatter", template="plotly_dark",
                 margin=dict(l=0, r=0, b=0, t=0),
@@ -792,7 +896,7 @@ if uploaded:
         if all_graded_maneuvers:
             st.markdown("#### 🎯 YOUR FLIGHT — MANEUVER-BY-MANEUVER ACS BREAKDOWN")
             for gm in all_graded_maneuvers:
-                if gm['label'] == "EXTENDED CIRCLING / HOLD":
+                if not gm['is_gradeable']:
                     continue
                 with st.expander(f"MNVR {gm['id']} | {gm['label']} | Overall: {gm['status']}"):
                     if gm['grade_rows']:
