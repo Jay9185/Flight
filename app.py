@@ -398,19 +398,15 @@ def detect_emergency_descents(df):
 # ─────────────────────────────────────────────
 # PATTERN WORK GRADER
 # ─────────────────────────────────────────────
-def detect_pattern_legs(df, td_row, pattern_alt_agl=PATTERN_ALT_AGL):
-    """
-    Isolate a single circuit by finding the most recent departure (ground→airborne
-    transition) before this touchdown, then match leg headings within that window.
+MAX_CIRCUIT_MIN = 20  # minutes — circuits longer than this are straight-in approaches, not patterns
 
-    Key design decisions vs. original:
-    - NO altitude band filter: final/base descend below any sensible floor, so we
-      detect legs by heading only and report whatever altitude the aircraft was at.
-    - Circuit boundary: departure→touchdown, not a fixed 25-min lookback, so
-      overlapping circuits don't bleed heading data into each other.
-    - Runway heading computed from last 45 s while still FLYING (GS > threshold),
-      excluding slow flare/rollout rows.
-    - Heading tolerance widened to 35° to survive GPS track noise.
+def detect_pattern_legs(df, td_row, pattern_alt_agl=PATTERN_ALT_AGL, right_hand=False):
+    """
+    Isolate a single circuit by finding the most recent departure before this
+    touchdown, then match leg headings within that window.
+
+    Returns (legs_dict, runway_hdg, skip_reason) where skip_reason is a string
+    if the circuit was skipped (too long = straight-in), or None if graded.
     """
     td_time = td_row['Time']
 
@@ -424,31 +420,39 @@ def detect_pattern_legs(df, td_row, pattern_alt_agl=PATTERN_ALT_AGL):
     if not departures.empty:
         circuit_start = departures['Time'].iloc[-1]
     else:
-        # No departure detected (first circuit, or log starts airborne)
-        circuit_start = td_time - pd.Timedelta(minutes=20)
+        circuit_start = td_time - pd.Timedelta(minutes=MAX_CIRCUIT_MIN)
 
-    window = df[(df['Time'] >= circuit_start) & (df['Time'] <= td_time)].copy()
+    circuit_dur_min = (td_time - circuit_start).total_seconds() / 60.0
 
-    # ── Airborne-only slice: speed gate + minimum AGL ──
+    # ── KEY GATE: skip circuits that are too long to be a pattern ──
+    # A normal T&G circuit is 4–12 min. Anything longer is a cross-country
+    # or practice-area flight returning to land straight-in — not gradeable.
+    if circuit_dur_min > MAX_CIRCUIT_MIN:
+        return {}, None, f"STRAIGHT-IN / LONG APPROACH ({circuit_dur_min:.0f} min since last departure — not a circuit)"
+
+    window   = df[(df['Time'] >= circuit_start) & (df['Time'] <= td_time)].copy()
     airborne = window[(window['GS'] > MIN_AIRSPEED_KTS) & (window['Alt_AGL'] > 50)]
+
     if airborne.empty or len(airborne) < 10:
-        return {}, None
+        return {}, None, "INSUFFICIENT AIRBORNE DATA IN CIRCUIT WINDOW"
 
     # ── Runway heading: median track in last 45 s while still flying ──
     final_flying = airborne[airborne['Time'] >= td_time - pd.Timedelta(seconds=45)]
     if final_flying.empty:
-        return {}, None
+        return {}, None, "NO FLYING DATA IN FINAL 45s"
+
     runway_hdg = final_flying['Track'].median() % 360
 
-    # ── Left-hand pattern leg headings ──
+    # ── Leg headings: left-hand (standard) or right-hand ──
+    turn = -1 if right_hand else 1   # +1 = left turns add 90° per leg, -1 = right
     leg_headings = {
-        "CROSSWIND": (runway_hdg + 270) % 360,   # first 90° left turn after takeoff
-        "DOWNWIND":  (runway_hdg + 180) % 360,   # opposite runway direction
-        "BASE":      (runway_hdg + 90)  % 360,   # turn toward runway
-        "FINAL":     runway_hdg,                  # aligned with runway
+        "CROSSWIND": (runway_hdg - turn * 90)  % 360,
+        "DOWNWIND":  (runway_hdg + 180)         % 360,
+        "BASE":      (runway_hdg + turn * 90)   % 360,
+        "FINAL":     runway_hdg,
     }
 
-    HDG_TOL = 35  # degrees — wide enough for GPS noise, narrow enough to be meaningful
+    HDG_TOL = 35  # degrees
 
     legs = {}
     for leg_name, exp_hdg in leg_headings.items():
@@ -457,7 +461,7 @@ def detect_pattern_legs(df, td_row, pattern_alt_agl=PATTERN_ALT_AGL):
         if not leg_data.empty and leg_data['Dt'].sum() > 5:
             legs[leg_name] = leg_data
 
-    return legs, runway_hdg
+    return legs, runway_hdg, None
 
 
 
@@ -922,8 +926,16 @@ if uploaded:
                 min_value=400, max_value=2000, value=PATTERN_ALT_AGL, step=50
             )
 
+            right_hand = st.checkbox("🔄 RIGHT-HAND PATTERN", value=False)
+
             for t_idx, (td_index, td_row) in enumerate(touchdowns.iterrows()):
-                legs, runway_hdg = detect_pattern_legs(df, td_row, pattern_alt_agl=pattern_alt_input)
+                legs, runway_hdg, skip_reason = detect_pattern_legs(
+                    df, td_row, pattern_alt_agl=pattern_alt_input, right_hand=right_hand
+                )
+
+                if skip_reason:
+                    st.info(f"`RUNWAY CONTACT {t_idx+1} ({td_row['Time'].strftime('%H:%M:%S')} UTC): {skip_reason}`")
+                    continue
 
                 if not legs:
                     st.write(f"`CIRCUIT {t_idx+1}: insufficient pattern data found`")
