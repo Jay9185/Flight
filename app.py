@@ -51,8 +51,12 @@ STALL_SPEED_KTS        = 55      # kts GS — stall detection threshold
 STALL_VSI_THRESH       = -300    # fpm — minimum sink rate to flag as stall entry
 EMERG_DESCENT_VSI      = -1500   # fpm — threshold for emergency descent detection
 EMERG_DESCENT_MIN_S    = 10      # seconds — minimum duration to log an ED event
-PATTERN_ALT_AGL        = 800     # ft AGL — nominal pattern altitude (user-adjustable in Tab 8)
+PATTERN_ALT_AGL        = 800     # ft AGL — nominal pattern altitude (user-adjustable in sidebar)
 NAVAID_RADIUS_NM       = 40      # nm — radius for airport/navaid fetch
+SLOW_FLIGHT_MARGIN_KTS = 20      # kts — band above stall speed considered "slow flight"
+MIN_SLOW_FLIGHT_DUR_S  = 20      # seconds — minimum sustained duration to log slow flight
+SLOW_FLIGHT_VSI_BAND   = 200     # fpm — max |VSI| to count as "maintaining altitude"
+MIN_TRACK_POINTS       = 20      # minimum coordinate records required for reliable analysis
 
 # ─────────────────────────────────────────────
 # FAA ACS STANDARDS REFERENCE TABLE
@@ -98,6 +102,33 @@ ACS_STANDARDS = {
         "params": {
             "Pattern Altitude Dev":    {"unit": "ft",  "ppl_tol": 100, "cpl_tol": 50,  "lower_better": True,  "desc": "Deviation from pattern altitude on downwind"},
             "Final Heading Error":     {"unit": "°",   "ppl_tol": 10,  "cpl_tol": 5,   "lower_better": True,  "desc": "Alignment error with runway heading on final"},
+        }
+    },
+    "CHANDELLE": {
+        "ref": "ACS PA.VIII.A / CA.VIII.A",
+        "params": {
+            "Rollout Heading Error":   {"unit": "°",   "ppl_tol": 10,  "cpl_tol": 5,   "lower_better": True,  "desc": "Heading error from reciprocal at rollout"},
+            "Altitude Gain":           {"unit": "ft",  "ppl_tol": 0,   "cpl_tol": 50,  "lower_better": False, "desc": "Net altitude gained through the climbing turn (approximate — ACS also requires rollout just above stall speed, which cannot be verified from GPS track alone)"},
+        }
+    },
+    "LAZY EIGHT": {
+        "ref": "ACS PA.VIII.B / CA.VIII.B",
+        "params": {
+            "Heading Return Error":    {"unit": "°",   "ppl_tol": 15,  "cpl_tol": 10,  "lower_better": True,  "desc": "Heading error vs. entry heading after the full figure-eight"},
+            "Altitude Return Dev":     {"unit": "ft",  "ppl_tol": 100, "cpl_tol": 50,  "lower_better": True,  "desc": "Altitude deviation vs. entry altitude after the full figure-eight (approximate — ACS grades each 90°/180° point individually)"},
+        }
+    },
+    "STEEP SPIRAL": {
+        "ref": "ACS PA.VIII.C / CA.VIII.C",
+        "params": {
+            "Rollout Heading Error":   {"unit": "°",   "ppl_tol": 10,  "cpl_tol": 10,  "lower_better": True,  "desc": "Heading error vs. entry heading at rollout"},
+        }
+    },
+    "SLOW FLIGHT": {
+        "ref": "ACS PA.V.A / CA.V.A",
+        "params": {
+            "Altitude Deviation":      {"unit": "ft",  "ppl_tol": 100, "cpl_tol": 50,  "lower_better": True,  "desc": "Max deviation from segment entry altitude while slow"},
+            "Airspeed Control Range":  {"unit": "kt",  "ppl_tol": 10,  "cpl_tol": 5,   "lower_better": True,  "desc": "Spread between max and min groundspeed during the segment"},
         }
     },
 }
@@ -171,71 +202,124 @@ def fetch_airports_navaids(lat, lon, radius_nm=NAVAID_RADIUS_NM):
 # ─────────────────────────────────────────────
 @st.cache_data
 def process_kml(file_content):
-    soup = BeautifulSoup(file_content, 'xml')
+    """
+    Parse a Google Earth KML track log into a fully-derived telemetry DataFrame.
+    Never raises: on any failure returns (empty_df, human_readable_error_string).
+    """
+    # ── Parse XML, trying the best available parser ────────────────────
+    soup = None
+    parse_errors = []
+    for parser_name in ('xml', 'lxml-xml', 'html.parser'):
+        try:
+            soup = BeautifulSoup(file_content, parser_name)
+            break
+        except Exception as e:  # missing optional parser lib, malformed doc, etc.
+            parse_errors.append(f"{parser_name}: {e}")
+            soup = None
+
+    if soup is None:
+        return pd.DataFrame(), (
+            "Could not parse this file as XML/KML. "
+            f"Details: {'; '.join(parse_errors)}"
+        )
+
     times  = soup.find_all('when')
     coords = soup.find_all('gx:coord')
+    # html.parser strips namespace prefixes — retry without the "gx:" prefix
+    if not coords:
+        coords = soup.find_all('coord')
 
     if not times or not coords:
         return pd.DataFrame(), "KML is missing <when> or <gx:coord> tags. Is this a Google Earth track log?"
 
+    if len(times) != len(coords):
+        n = min(len(times), len(coords))
+    else:
+        n = len(times)
+
     data = []
-    for t, c in zip(times, coords):
-        parts = c.text.split()
-        if len(parts) == 3:
+    missing_alt_count = 0
+    for t, c in zip(times[:n], coords[:n]):
+        try:
+            parts = c.text.split()
+            if len(parts) == 3:
+                lon, lat, alt_m = float(parts[0]), float(parts[1]), float(parts[2])
+            elif len(parts) == 2:
+                lon, lat, alt_m = float(parts[0]), float(parts[1]), 0.0
+                missing_alt_count += 1
+            else:
+                continue
             data.append({
                 'Time':    t.text.replace('Z', ''),
-                'Lon':     float(parts[0]),
-                'Lat':     float(parts[1]),
-                'Alt_Raw': float(parts[2]) * 3.28084,
+                'Lon':     lon,
+                'Lat':     lat,
+                'Alt_Raw': alt_m * 3.28084,
             })
+        except (ValueError, TypeError):
+            continue  # skip malformed record rather than crashing the whole parse
 
     df = pd.DataFrame(data)
     if df.empty:
         return df, "No valid coordinate records found in KML."
 
-    df['Time'] = pd.to_datetime(df['Time'])
+    try:
+        df['Time'] = pd.to_datetime(df['Time'], errors='coerce')
+    except Exception:
+        return pd.DataFrame(), "Could not parse timestamps in this KML — <when> tags may be malformed."
+
+    df = df.dropna(subset=['Time']).sort_values('Time').reset_index(drop=True)
+    # Duplicate timestamps produce zero-duration steps that corrupt rate math downstream.
+    df = df.drop_duplicates(subset=['Time'], keep='first').reset_index(drop=True)
+
+    if len(df) < MIN_TRACK_POINTS:
+        return pd.DataFrame(), (
+            f"Only {len(df)} usable track point(s) found — need at least "
+            f"{MIN_TRACK_POINTS} for reliable analysis. Is this a short or corrupted log?"
+        )
+
+    if missing_alt_count:
+        df.attrs['missing_alt_count'] = missing_alt_count
+
     df['Dt']   = df['Time'].diff().dt.total_seconds().fillna(1)
     dt_safe    = df['Dt'].replace(0, np.nan)
 
-    df['Cumulative_Min'] = df['Dt'].cumsum() / 60.0
-    df['Alt_Smooth']     = df['Alt_Raw'].rolling(window=7, center=True, min_periods=1).mean()
-    df['VSI']            = (df['Alt_Smooth'].diff() / (dt_safe / 60.0)).fillna(0).rolling(5).mean()
+    try:
+        df['Cumulative_Min'] = df['Dt'].cumsum() / 60.0
+        df['Alt_Smooth']     = df['Alt_Raw'].rolling(window=7, center=True, min_periods=1).mean()
+        df['VSI']            = (df['Alt_Smooth'].diff() / (dt_safe / 60.0)).fillna(0).rolling(5, min_periods=1).mean()
 
-    field_elev   = df['Alt_Smooth'].quantile(ALT_PERCENTILE_FIELD)
-    df['Alt_AGL'] = df['Alt_Smooth'] - field_elev
+        field_elev   = df['Alt_Smooth'].quantile(ALT_PERCENTILE_FIELD)
+        df['Alt_AGL'] = df['Alt_Smooth'] - field_elev
 
-    dist, bear = [0], [0]
-    for i in range(1, len(df)):
-        dist.append(haversine_distance(
-            df.iloc[i-1]['Lat'], df.iloc[i-1]['Lon'],
-            df.iloc[i]['Lat'],   df.iloc[i]['Lon']
-        ))
-        bear.append(calculate_bearing(
-            df.iloc[i-1]['Lat'], df.iloc[i-1]['Lon'],
-            df.iloc[i]['Lat'],   df.iloc[i]['Lon']
-        ))
+        lat_arr, lon_arr = df['Lat'].to_numpy(), df['Lon'].to_numpy()
+        dist, bear = [0.0], [0.0]
+        for i in range(1, len(df)):
+            dist.append(haversine_distance(lat_arr[i-1], lon_arr[i-1], lat_arr[i], lon_arr[i]))
+            bear.append(calculate_bearing(lat_arr[i-1], lon_arr[i-1], lat_arr[i], lon_arr[i]))
 
-    df['GS']    = (pd.Series(dist) / (dt_safe / 3600.0)).fillna(0).rolling(5).mean()
-    df['Track'] = bear
+        df['GS']    = (pd.Series(dist) / (dt_safe / 3600.0)).fillna(0).rolling(5, min_periods=1).mean()
+        df['Track'] = bear
 
-    df['Track_Delta'] = df['Track'].diff().abs()
-    df['Track_Delta'] = df['Track_Delta'].apply(lambda x: 360 - x if x > 180 else x).fillna(0)
+        df['Track_Delta'] = df['Track'].diff().abs()
+        df['Track_Delta'] = df['Track_Delta'].apply(lambda x: 360 - x if x > 180 else x).fillna(0)
 
-    # Signed heading change: positive = right/clockwise, negative = left/counterclockwise
-    # Normalised to [-180, 180] per step so wrap-arounds don't corrupt the sign.
-    raw_delta = df['Track'].diff()
-    df['Track_Delta_Signed'] = raw_delta.apply(
-        lambda x: ((x + 180) % 360) - 180 if pd.notna(x) else 0
-    ).fillna(0)
+        # Signed heading change: positive = right/clockwise, negative = left/counterclockwise
+        # Normalised to [-180, 180] per step so wrap-arounds don't corrupt the sign.
+        raw_delta = df['Track'].diff()
+        df['Track_Delta_Signed'] = raw_delta.apply(
+            lambda x: ((x + 180) % 360) - 180 if pd.notna(x) else 0
+        ).fillna(0)
 
-    df['Turn_Rate'] = (df['Track_Delta'] / dt_safe).rolling(window=3).mean().fillna(0)
+        df['Turn_Rate'] = (df['Track_Delta'] / dt_safe).rolling(window=3, min_periods=1).mean().fillna(0)
 
-    g              = 32.174
-    df['Vel_fps']  = df['GS'] * 1.68781
-    turn_rate_rad  = np.radians(df['Turn_Rate'].fillna(0))
-    df['Bank_Angle'] = np.degrees(np.arctan((turn_rate_rad * df['Vel_fps']) / g)).fillna(0)
-    df['G_Load']     = (1 / np.cos(np.radians(df['Bank_Angle']))).clip(1, 3)
-    df['Specific_Energy'] = df['Alt_Smooth'] + ((df['Vel_fps'] ** 2) / (2 * g))
+        g              = 32.174
+        df['Vel_fps']  = df['GS'] * 1.68781
+        turn_rate_rad  = np.radians(df['Turn_Rate'].fillna(0))
+        df['Bank_Angle'] = np.degrees(np.arctan((turn_rate_rad * df['Vel_fps']) / g)).fillna(0).clip(0, 89)
+        df['G_Load']     = (1 / np.cos(np.radians(df['Bank_Angle']))).clip(1, 3)
+        df['Specific_Energy'] = df['Alt_Smooth'] + ((df['Vel_fps'] ** 2) / (2 * g))
+    except Exception as e:
+        return pd.DataFrame(), f"Unexpected error while computing flight parameters: {e}"
 
     return df, None
 
@@ -271,26 +355,45 @@ def grade_maneuver(label, row, mdata):
         })
 
     std_key = "360° STEEP TURN"       if "360° STEEP TURN" in label else \
+              "CHANDELLE"             if "CHANDELLE" in label else \
               "180° COURSE REVERSAL"  if "180° COURSE REVERSAL" in label else \
+              "LAZY EIGHT"            if "LAZY EIGHT" in label else \
+              "STEEP SPIRAL"          if "STEEP SPIRAL" in label else \
               "GROUND REFERENCE / S-TURNS"
 
-    add("Altitude Deviation", max_dev, std_key)
+    entry_track = mdata['Track'].iloc[0]
+    exit_track  = mdata['Track'].iloc[-1]
 
-    if "360° STEEP TURN" in label:
+    if std_key in ("360° STEEP TURN", "180° COURSE REVERSAL", "GROUND REFERENCE / S-TURNS"):
+        add("Altitude Deviation", max_dev, std_key)
+
+    if std_key == "360° STEEP TURN":
         avg_bank = mdata['Bank_Angle'].median()
         bank_dev = abs(avg_bank - 45)
         add("Bank Dev from 45°", bank_dev, std_key)
-
-        entry_track = mdata['Track'].iloc[0]
-        exit_track  = mdata['Track'].iloc[-1]
-        hdg_err     = heading_diff(entry_track, exit_track)
+        hdg_err = heading_diff(entry_track, exit_track)
         add("Rollout Heading Error", hdg_err, std_key)
 
-    elif "180° COURSE REVERSAL" in label:
-        entry_track   = mdata['Track'].iloc[0]
-        exit_track    = mdata['Track'].iloc[-1]
+    elif std_key == "180° COURSE REVERSAL":
         expected_exit = (entry_track + 180) % 360
         hdg_err       = heading_diff(exit_track, expected_exit)
+        add("Rollout Heading Error", hdg_err, std_key)
+
+    elif std_key == "CHANDELLE":
+        expected_exit = (entry_track + 180) % 360
+        hdg_err       = heading_diff(exit_track, expected_exit)
+        add("Rollout Heading Error", hdg_err, std_key)
+        alt_gain = row.get('alt_last', row['entry_alt']) - row['entry_alt']
+        add("Altitude Gain", alt_gain, std_key)
+
+    elif std_key == "LAZY EIGHT":
+        hdg_err = heading_diff(entry_track, exit_track)
+        add("Heading Return Error", hdg_err, std_key)
+        alt_dev = abs(row.get('alt_last', row['entry_alt']) - row['entry_alt'])
+        add("Altitude Return Dev", alt_dev, std_key)
+
+    elif std_key == "STEEP SPIRAL":
+        hdg_err = heading_diff(entry_track, exit_track)
         add("Rollout Heading Error", hdg_err, std_key)
 
     return results
@@ -355,6 +458,45 @@ def detect_stalls(df):
             'min_vsi':      edata['VSI'].min(),
             'duration':     duration,
             'data':         edata,
+        })
+    return events
+
+# ─────────────────────────────────────────────
+# SLOW FLIGHT DETECTOR
+# ─────────────────────────────────────────────
+def detect_slow_flight(df):
+    """
+    Flag sustained segments where GS sits just above stall speed while the
+    aircraft holds altitude (|VSI| stays small) — i.e. actual slow flight,
+    as distinct from a stall entry (which has a large negative VSI).
+    Returns list of event dicts.
+    """
+    df = df.copy()
+    upper = STALL_SPEED_KTS + SLOW_FLIGHT_MARGIN_KTS
+    df['SlowFlight_Flag'] = (
+        (df['GS'] >= STALL_SPEED_KTS) &
+        (df['GS'] <= upper) &
+        (df['VSI'].abs() < SLOW_FLIGHT_VSI_BAND) &
+        (df['Alt_AGL'] > 300)
+    )
+    df['SlowFlight_Event_ID'] = (df['SlowFlight_Flag'] != df['SlowFlight_Flag'].shift()).cumsum()
+
+    events = []
+    for eid, edata in df[df['SlowFlight_Flag']].groupby('SlowFlight_Event_ID'):
+        duration = edata['Dt'].sum()
+        if duration < MIN_SLOW_FLIGHT_DUR_S:
+            continue
+        entry_alt = edata['Alt_Smooth'].iloc[0]
+        alt_dev   = (edata['Alt_Smooth'] - entry_alt).abs().max()
+        gs_range  = edata['GS'].max() - edata['GS'].min()
+        events.append({
+            'time':      edata['Time'].iloc[0],
+            'entry_alt': entry_alt,
+            'alt_dev':   alt_dev,
+            'gs_range':  gs_range,
+            'avg_gs':    edata['GS'].mean(),
+            'duration':  duration,
+            'data':      edata,
         })
     return events
 
@@ -496,10 +638,28 @@ def classify_maneuver(row):
     duration  = row['duration']
     max_bank  = row['max_bank']
     mean_agl  = row['mean_agl']
+    entry_alt = row['entry_alt']
+    alt_last  = row.get('alt_last', entry_alt)
+    gs_first  = row.get('gs_first', row['gs_max'])
+    gs_last   = row.get('gs_last', row['gs_min'])
     consistency = abs_net / total if total > 0 else 0
     direction   = "RIGHT" if net > 0 else "LEFT"
 
+    alt_change  = alt_last - entry_alt      # + climb, - descent, over the whole maneuver
+    speed_loss  = gs_first - gs_last         # + decelerating, - accelerating
+
     caveats = []
+
+    # ── STEEP SPIRAL ─────────────────────────────────────────────────────
+    # Multiple consistent-direction circles (≥ ~2.5 turns) while descending.
+    # Checked before the generic "extended circling" catch-all since a spiral
+    # is a single clean direction (high consistency), not a wandering hold.
+    if consistency >= 0.75 and total >= 900:
+        if alt_change <= -300:
+            return f"STEEP SPIRAL ({direction})", True, caveats
+        else:
+            caveats.append(f"ALT CHANGE {alt_change:+.0f}ft — steep spiral requires a sustained descent")
+            return f"EXTENDED TURN, NO DESCENT ({direction})", False, caveats
 
     # ── EXTENDED CIRCLING / HOLD ────────────────────────────────────────
     # High total turn but near-zero consistency = back-and-forth = circling/holding.
@@ -517,10 +677,22 @@ def classify_maneuver(row):
             caveats.append(f"MAX BANK {max_bank:.0f}° — ACS requires 45°, not graded as steep turn")
             return f"360° TURN SHALLOW BANK ({direction})", False, caveats
 
+    # ── CHANDELLE ────────────────────────────────────────────────────────
+    # A 180° reversal that also climbs and bleeds airspeed toward stall —
+    # distinguishes it from a flat 180° course reversal in the same net-turn band.
+    if consistency >= 0.65 and 145 <= abs_net <= 215 and alt_change >= 50 and speed_loss >= 10:
+        return f"CHANDELLE ({direction})", True, caveats
+
     # ── 180° COURSE REVERSAL ────────────────────────────────────────────
     # Single clean reversal: consistency ≥ 0.75, net heading 145–215°.
     if consistency >= 0.75 and 145 <= abs_net <= 215:
         return f"180° COURSE REVERSAL ({direction})", True, caveats
+
+    # ── LAZY EIGHT ───────────────────────────────────────────────────────
+    # Alternating-direction turns (low consistency, like S-turns) but flown
+    # at altitude rather than over the ground — the key ACS distinguisher.
+    if consistency < 0.40 and 500 <= total <= 950 and mean_agl > 1500:
+        return "LAZY EIGHT", True, caveats
 
     # ── S-TURNS / GROUND REFERENCE ──────────────────────────────────────
     # Low consistency (alternating turns) AND low altitude.
@@ -566,11 +738,32 @@ def acs_status_color(value, ppl_tol, cpl_tol, lower_better=True):
 st.title("🛰️ T.G. TACTICAL FLIGHT DEBRIEF")
 st.markdown("`SYSTEM STATUS: ONLINE | ADVANCED AERO ENGINE ARMED`")
 
+with st.sidebar:
+    st.markdown("### ⚙️ GLOBAL SETTINGS")
+    st.number_input(
+        "PATTERN ALTITUDE AGL (FT)",
+        min_value=400, max_value=2000, value=PATTERN_ALT_AGL, step=50,
+        key="pattern_alt_agl",
+        help="Adjust to match your airport's published traffic pattern altitude — used by the Pattern Work Grader."
+    )
+    st.checkbox("🔄 RIGHT-HAND PATTERN", value=False, key="right_hand_pattern")
+    st.markdown("---")
+    st.caption("`T.G. TACTICAL FLIGHT DEBRIEF`\n\nUpload a Google Earth (.kml) GPS track log to begin.")
+
 uploaded = st.file_uploader("", type=['kml'])
 
-if uploaded:
-    raw_content = uploaded.getvalue().decode('utf-8')
-    df, parse_error = process_kml(raw_content)
+
+def run_analysis(uploaded):
+    # Robust decode: some KML exports aren't strict UTF-8.
+    raw_bytes = uploaded.getvalue()
+    try:
+        raw_content = raw_bytes.decode('utf-8')
+    except UnicodeDecodeError:
+        st.warning("`FILE IS NOT VALID UTF-8 — DECODING WITH ERRORS IGNORED (some characters may be dropped)`")
+        raw_content = raw_bytes.decode('utf-8', errors='ignore')
+
+    with st.spinner("PROCESSING TELEMETRY..."):
+        df, parse_error = process_kml(raw_content)
 
     if parse_error:
         st.error(f"⚠️ **KML PARSE FAILURE:** {parse_error}")
@@ -580,9 +773,16 @@ if uploaded:
         st.warning("No data found in file.")
         st.stop()
 
+    if df.attrs.get('missing_alt_count'):
+        st.warning(
+            f"`{df.attrs['missing_alt_count']} COORDINATE RECORD(S) HAD NO ALTITUDE DATA — "
+            f"DEFAULTED TO 0m. AGL/VSI VALUES MAY BE LESS RELIABLE.`"
+        )
+
     # Use median position for METAR — more representative than first point on
     # cross-country flights that land somewhere other than departure.
-    metar          = fetch_metar(df['Lat'].median(), df['Lon'].median())
+    with st.spinner("FETCHING SURFACE WX & NAVAIDS..."):
+        metar = fetch_metar(df['Lat'].median(), df['Lon'].median())
     total_mins     = int(df['Dt'].sum() / 60)
     field_elevation = df['Alt_Smooth'].quantile(ALT_PERCENTILE_FIELD)
 
@@ -594,8 +794,10 @@ if uploaded:
     c3.metric("MAX G-LOAD",      f"+{df['G_Load'].max():.1f} G")
     c4.metric("TOTAL SORTIE",    f"{total_mins} MIN")
 
-    if metar:
-        st.info(f"📍 **SURFACE WX ({metar.get('icaoId')}):** `{metar.get('rawOb')}`")
+    if isinstance(metar, dict) and metar.get('rawOb'):
+        st.info(f"📍 **SURFACE WX ({metar.get('icaoId', '?')}):** `{metar.get('rawOb')}`")
+    else:
+        st.caption("`NO SURFACE WX AVAILABLE FOR THIS TRACK'S POSITION/TIME`")
 
     # ── MANEUVER ANALYSIS ────────────────────
     st.markdown("### 🎯 ACS MANEUVER ANALYSIS")
@@ -609,11 +811,14 @@ if uploaded:
         net_turn=  ('Track_Delta_Signed', 'sum'),   # signed: + = right, - = left
         duration=  ('Dt',                 'sum'),
         entry_alt= ('Alt_Smooth',         'first'),
+        alt_last=  ('Alt_Smooth',         'last'),
         alt_max=   ('Alt_Smooth',         'max'),
         alt_min=   ('Alt_Smooth',         'min'),
         peak_g=    ('G_Load',             'max'),
         gs_max=    ('GS',                 'max'),
         gs_min=    ('GS',                 'min'),
+        gs_first=  ('GS',                 'first'),
+        gs_last=   ('GS',                 'last'),
         mean_bank= ('Bank_Angle',         'mean'),
         max_bank=  ('Bank_Angle',         'max'),
         mean_agl=  ('Alt_AGL',            'mean'),
@@ -636,17 +841,24 @@ if uploaded:
 
         label, is_gradeable, caveats = classify_maneuver(row)
 
-        if not is_gradeable:
-            color, status = "#888888", "UNGRADED"
-        elif "360°" in label:
-            color, status = acs_status_color(max_dev, 100, 50)
-        elif "180°" in label:
-            color, status = acs_status_color(max_dev, 100, 50)
-        else:
-            color, status = acs_status_color(max_dev, 100, 50)
-
         # Grade and store (only for labelled gradeable maneuvers)
         grade_rows = grade_maneuver(label, row, mdata) if is_gradeable else []
+
+        if not is_gradeable:
+            color, status = "#888888", "UNGRADED"
+        elif grade_rows:
+            # Overall status reflects the WORST-performing graded parameter,
+            # rather than always keying off altitude deviation — this generalizes
+            # correctly to maneuvers (Chandelle, Lazy Eight, Steep Spiral) whose
+            # primary ACS parameter isn't altitude.
+            if all(r['_cpl_pass'] for r in grade_rows):
+                color, status = "#00FF41", "CPL GRADE"
+            elif all(r['_ppl_pass'] for r in grade_rows):
+                color, status = "#FF9F1C", "PPL PASS"
+            else:
+                color, status = "#FF4444", "ACS BUST"
+        else:
+            color, status = acs_status_color(max_dev, 100, 50)
         all_graded_maneuvers.append({
             'id': found_mnvrs, 'label': label, 'color': color, 'status': status,
             'total_turn': total_turn, 'row': row, 'mdata': mdata,
@@ -680,14 +892,14 @@ if uploaded:
                 wind_est = (row['gs_max'] - row['gs_min']) / 2
                 st.write(f"`~EST WINDS ALOFT: {int(wind_est)} KTS (valid only for complete circular turns)`")
 
-            fig_mnvr = px.line_mapbox(mdata, lat="Lat", lon="Lon", zoom=14.5, height=300)
+            fig_mnvr = px.line_map(mdata, lat="Lat", lon="Lon", zoom=14.5, height=300)
             fig_mnvr.update_traces(line=dict(color=color if is_gradeable else '#888888', width=4))
             fig_mnvr.update_layout(
-                mapbox_style="carto-darkmatter", template="plotly_dark",
+                map_style="carto-darkmatter", template="plotly_dark",
                 margin=dict(l=0, r=0, b=0, t=0),
-                mapbox=dict(center=dict(lat=mdata['Lat'].mean(), lon=mdata['Lon'].mean()))
+                map=dict(center=dict(lat=mdata['Lat'].mean(), lon=mdata['Lon'].mean()))
             )
-            st.plotly_chart(fig_mnvr, use_container_width=True, key=f"mnvr_map_{row['Maneuver_ID']}_{found_mnvrs}")
+            st.plotly_chart(fig_mnvr, width='stretch', key=f"mnvr_map_{row['Maneuver_ID']}_{found_mnvrs}")
 
     if found_mnvrs == 0:
         st.info("`NO GRADABLE MANEUVERS DETECTED — minimum 15s duration and 100° heading sweep required`")
@@ -696,6 +908,29 @@ if uploaded:
     df['On_Ground']         = df['Alt_AGL'] < AGL_TOUCHDOWN_FT
     df['Touchdown_Trigger'] = (df['On_Ground'] == True) & (df['On_Ground'].shift(1) == False)
     touchdowns_all          = df[df['Touchdown_Trigger']]
+
+    # ── Pre-compute all event detectors once (used by Mission Summary + Tabs 6/7) ──
+    stall_events      = detect_stalls(df)
+    slow_flight_events = detect_slow_flight(df)
+    ed_events         = detect_emergency_descents(df)
+
+    # ── MISSION SUMMARY SCORECARD ─────────────
+    st.markdown("### 🧾 MISSION SUMMARY")
+    graded = [gm for gm in all_graded_maneuvers if gm['is_gradeable']]
+    cpl_count = sum(1 for gm in graded if gm['status'] == "CPL GRADE")
+    ppl_count = sum(1 for gm in graded if gm['status'] == "PPL PASS")
+    bust_count = sum(1 for gm in graded if gm['status'] == "ACS BUST")
+
+    sc1, sc2, sc3, sc4 = st.columns(4)
+    sc1.metric("MANEUVERS GRADED", f"{len(graded)}", help="Total ACS-gradeable maneuvers detected")
+    sc2.metric("CPL / PPL / BUST", f"{cpl_count} / {ppl_count} / {bust_count}")
+    sc3.metric("STALL / SLOW-FLT EVENTS", f"{len(stall_events)} / {len(slow_flight_events)}")
+    sc4.metric("RUNWAY CONTACTS", f"{len(touchdowns_all)}")
+
+    if bust_count > 0:
+        st.warning(f"`⚠️ {bust_count} MANEUVER(S) OUTSIDE PPL ACS TOLERANCE — see ACS STANDARDS PANEL tab for detail`")
+    elif len(graded) > 0:
+        st.success("`✅ ALL GRADED MANEUVERS WITHIN AT LEAST PPL ACS TOLERANCE`")
 
     # ── TABS ─────────────────────────────────
     st.markdown("### 🗺️ SPATIAL TELEMETRY, PHYSICS & ADVANCED ANALYSIS")
@@ -728,7 +963,7 @@ if uploaded:
 
         show_navaids = st.checkbox("🔵 OVERLAY AIRPORTS & NAVAIDS", value=True)
 
-        fig_map = px.scatter_mapbox(
+        fig_map = px.scatter_map(
             df, lat="Lat", lon="Lon", color=active_col,
             color_continuous_scale=active_cs, range_color=active_range,
             zoom=10, height=680,
@@ -745,7 +980,7 @@ if uploaded:
                     f"✈ {a.get('icaoId','?')} | {a.get('name','')}<br>ELEV: {a.get('elev','?')} FT"
                     for a in airports if a.get('lat') and a.get('lon')
                 ]
-                fig_map.add_trace(go.Scattermapbox(
+                fig_map.add_trace(go.Scattermap(
                     lat=ap_lats, lon=ap_lons, mode='markers+text',
                     marker=dict(size=14, color='#FF9F1C', symbol='airport'),
                     text=[a.get('icaoId', '') for a in airports if a.get('lat') and a.get('lon')],
@@ -762,7 +997,7 @@ if uploaded:
                     filtered = [n for n in navaids if nav_type in (n.get('type') or '').upper()
                                 and n.get('lat') and n.get('lon')]
                     if filtered:
-                        fig_map.add_trace(go.Scattermapbox(
+                        fig_map.add_trace(go.Scattermap(
                             lat=[n['lat'] for n in filtered],
                             lon=[n['lon'] for n in filtered],
                             mode='markers+text',
@@ -779,11 +1014,11 @@ if uploaded:
                         ))
 
         fig_map.update_layout(
-            mapbox_style="carto-darkmatter", template="plotly_dark",
+            map_style="carto-darkmatter", template="plotly_dark",
             margin=dict(l=0, r=0, b=0, t=0),
             legend=dict(bgcolor='rgba(0,0,0,0.7)', font=dict(color='#C0C0C0'))
         )
-        st.plotly_chart(fig_map, use_container_width=True, config={'scrollZoom': True})
+        st.plotly_chart(fig_map, width='stretch', config={'scrollZoom': True})
 
     # ── TAB 2: 3D MAP ──────────────────────────
     with t2:
@@ -815,7 +1050,7 @@ if uploaded:
                     aspectmode='manual', aspectratio=dict(x=1, y=1, z=0.4)
                 )
             )
-            st.plotly_chart(fig_3d, use_container_width=True, config={
+            st.plotly_chart(fig_3d, width='stretch', config={
                 'scrollZoom': True, 'displayModeBar': True,
                 'displaylogo': False, 'modeBarButtonsToRemove': ['resetCameraDefault3d']
             })
@@ -829,12 +1064,12 @@ if uploaded:
         fig_aero.add_trace(go.Scatter(x=df['Time'], y=df['Specific_Energy'], name="SPECIFIC ENERGY", line=dict(color="#FF9F1C", width=2)))
         fig_aero.add_trace(go.Scatter(x=df['Time'], y=df['Alt_Smooth'], name="POTENTIAL ENERGY (ALT)", line=dict(color="#00FF41", width=2, dash='dot')))
         fig_aero.update_layout(template="plotly_dark", xaxis_title="TIME (UTC)", yaxis_title="ENERGY STATE (ft equivalent)", height=400)
-        st.plotly_chart(fig_aero, use_container_width=True, config={'scrollZoom': True})
+        st.plotly_chart(fig_aero, width='stretch', config={'scrollZoom': True})
 
         fig_bank = go.Figure()
         fig_bank.add_trace(go.Scatter(x=df['Time'], y=df['Bank_Angle'], name="ESTIMATED BANK (°)", line=dict(color="#00FFFF", width=2)))
         fig_bank.update_layout(template="plotly_dark", xaxis_title="TIME (UTC)", yaxis_title="BANK ANGLE (°)", height=300)
-        st.plotly_chart(fig_bank, use_container_width=True, config={'scrollZoom': True})
+        st.plotly_chart(fig_bank, width='stretch', config={'scrollZoom': True})
 
     # ── TAB 4: TOUCH & GO ─────────────────────
     with t4:
@@ -856,8 +1091,8 @@ if uploaded:
 
             fig_glide.update_layout(template="plotly_dark", title="GLIDEPATH PROFILE (AGL)",     xaxis_title="SECONDS TO TOUCHDOWN", yaxis_title="ALTITUDE (FT AGL)",   hovermode="x unified", height=400)
             fig_speed.update_layout(template="plotly_dark", title="AIRSPEED DECAY PROFILE",      xaxis_title="SECONDS TO TOUCHDOWN", yaxis_title="GROUNDSPEED (KTS)",    hovermode="x unified", height=300)
-            st.plotly_chart(fig_glide, use_container_width=True, config={'scrollZoom': True})
-            st.plotly_chart(fig_speed, use_container_width=True, config={'scrollZoom': True})
+            st.plotly_chart(fig_glide, width='stretch', config={'scrollZoom': True})
+            st.plotly_chart(fig_speed, width='stretch', config={'scrollZoom': True})
         else:
             st.warning("`NO RUNWAY CONTACT DETECTED IN LOG.`")
 
@@ -881,7 +1116,7 @@ if uploaded:
                 })
         ref_df = pd.DataFrame(ref_rows)
         st.dataframe(
-            ref_df, use_container_width=True, hide_index=True,
+            ref_df, width='stretch', hide_index=True,
             column_config={
                 "Maneuver":      st.column_config.TextColumn(width="medium"),
                 "ACS Ref":       st.column_config.TextColumn(width="small"),
@@ -909,19 +1144,19 @@ if uploaded:
     # ── TAB 6: STALL & SLOW FLIGHT ────────────
     with t6:
         st.write(f"`STALL DETECTOR — FLAGS GS < {STALL_SPEED_KTS} KTS WITH VSI < {STALL_VSI_THRESH} FPM WHILE AIRBORNE`")
-        stall_events = detect_stalls(df)
 
         if stall_events:
-            st.info(f"⚠️ **{len(stall_events)} STALL / SLOW FLIGHT EVENT(S) DETECTED**")
+            st.info(f"⚠️ **{len(stall_events)} STALL EVENT(S) DETECTED**")
 
             for i, ev in enumerate(stall_events):
                 alt_loss     = ev['alt_loss']
                 color, grade = acs_status_color(alt_loss, 100, 50)
 
                 with st.expander(f"STALL {i+1} | {ev['time'].strftime('%H:%M:%S')} UTC | ALT LOSS: {int(alt_loss)} FT | {grade}"):
-                    col_a, col_b, col_c, col_d = st.columns(4)
+                    col_a, col_b = st.columns(2)
                     col_a.metric("ENTRY ALT",    f"{int(ev['entry_alt'])} FT MSL")
                     col_b.metric("RECOVERY ALT", f"{int(ev['recovery_alt'])} FT MSL")
+                    col_c, col_d = st.columns(2)
                     col_c.metric("ALT LOSS",     f"{int(alt_loss)} FT")
                     col_d.metric("MIN GS",       f"{ev['min_gs']:.0f} KTS")
 
@@ -954,9 +1189,68 @@ if uploaded:
                                     anchor='free', position=0.92, color="#00FFFF"),
                         legend=dict(bgcolor='rgba(0,0,0,0)')
                     )
-                    st.plotly_chart(fig_stall, use_container_width=True, config={'scrollZoom': True})
+                    st.plotly_chart(fig_stall, width='stretch', config={'scrollZoom': True})
         else:
             st.success(f"`✅ NO STALL EVENTS DETECTED (GS never dropped below {STALL_SPEED_KTS} KTS with high sink rate while airborne)`")
+
+        st.markdown("---")
+        st.write(
+            f"`SLOW FLIGHT DETECTOR — FLAGS ≥{MIN_SLOW_FLIGHT_DUR_S}s SUSTAINED GS BETWEEN "
+            f"{STALL_SPEED_KTS}–{STALL_SPEED_KTS + SLOW_FLIGHT_MARGIN_KTS} KTS WHILE HOLDING ALTITUDE`"
+        )
+
+        if slow_flight_events:
+            st.info(f"🐢 **{len(slow_flight_events)} SLOW FLIGHT SEGMENT(S) DETECTED**")
+
+            for i, ev in enumerate(slow_flight_events):
+                alt_dev  = ev['alt_dev']
+                gs_range = ev['gs_range']
+                color_alt, grade_alt = acs_status_color(alt_dev, 100, 50)
+                color_gs,  grade_gs  = acs_status_color(gs_range, 10, 5)
+                overall = "CPL GRADE" if (grade_alt == "CPL GRADE" and grade_gs == "CPL GRADE") else \
+                          "ACS BUST" if (grade_alt == "ACS BUST" or grade_gs == "ACS BUST") else "PPL PASS"
+
+                with st.expander(f"SLOW FLIGHT {i+1} | {ev['time'].strftime('%H:%M:%S')} UTC | {int(ev['duration'])}s | {overall}"):
+                    col_a, col_b = st.columns(2)
+                    col_a.metric("ENTRY ALT",  f"{int(ev['entry_alt'])} FT MSL")
+                    col_b.metric("AVG GS",     f"{ev['avg_gs']:.0f} KTS")
+                    col_c, col_d = st.columns(2)
+                    col_c.metric("ALT DEVIATION", f"{int(alt_dev)} FT")
+                    col_d.metric("GS RANGE",      f"{gs_range:.0f} KTS")
+
+                    ppl_alt, cpl_alt = alt_dev <= 100, alt_dev <= 50
+                    ppl_gs,  cpl_gs  = gs_range <= 10, gs_range <= 5
+                    st.markdown(render_acs_table([
+                        {
+                            "Parameter": "Altitude Deviation", "Your Value": f"{int(alt_dev)} ft",
+                            "PPL Tol": "≤100 ft", "CPL Tol": "≤50 ft",
+                            "PPL": "✅ PASS" if ppl_alt else "❌ BUST", "CPL": "✅ PASS" if cpl_alt else "❌ BUST",
+                            "Description": "Max deviation from segment entry altitude while slow",
+                            "_ppl_pass": ppl_alt, "_cpl_pass": cpl_alt,
+                        },
+                        {
+                            "Parameter": "Airspeed Control Range", "Your Value": f"{gs_range:.1f} kt",
+                            "PPL Tol": "≤10 kt", "CPL Tol": "≤5 kt",
+                            "PPL": "✅ PASS" if ppl_gs else "❌ BUST", "CPL": "✅ PASS" if cpl_gs else "❌ BUST",
+                            "Description": "Spread between max and min groundspeed during the segment",
+                            "_ppl_pass": ppl_gs, "_cpl_pass": cpl_gs,
+                        },
+                    ]), unsafe_allow_html=True)
+
+                    edata = ev['data']
+                    fig_sf = go.Figure()
+                    fig_sf.add_trace(go.Scatter(x=edata['Time'], y=edata['Alt_AGL'], name="ALT AGL (FT)", line=dict(color="#00FF41", width=2)))
+                    fig_sf.add_trace(go.Scatter(x=edata['Time'], y=edata['GS'],      name="GS (KTS)",     line=dict(color="#FF9F1C", width=2), yaxis="y2"))
+                    fig_sf.update_layout(
+                        template="plotly_dark", height=300,
+                        xaxis=dict(title="TIME (UTC)", domain=[0, 0.9]),
+                        yaxis=dict(title="ALT AGL (FT)", color="#00FF41"),
+                        yaxis2=dict(title="GS (KTS)", overlaying='y', side='right', color="#FF9F1C"),
+                        legend=dict(bgcolor='rgba(0,0,0,0)')
+                    )
+                    st.plotly_chart(fig_sf, width='stretch', config={'scrollZoom': True})
+        else:
+            st.success("`✅ NO SUSTAINED SLOW FLIGHT SEGMENTS DETECTED`")
 
         # Slow-flight timeline: show GS across the whole flight
         st.markdown("#### 📉 FULL SORTIE GROUNDSPEED TIMELINE")
@@ -964,12 +1258,11 @@ if uploaded:
         fig_gs.add_trace(go.Scatter(x=df['Time'], y=df['GS'], name="GS (KTS)", line=dict(color="#FF9F1C", width=1.5)))
         fig_gs.add_hline(y=STALL_SPEED_KTS, line=dict(color="#FF4444", dash="dash", width=1), annotation_text=f"Stall Threshold ({STALL_SPEED_KTS} KTS)", annotation_font_color="#FF4444")
         fig_gs.update_layout(template="plotly_dark", xaxis_title="TIME (UTC)", yaxis_title="GROUNDSPEED (KTS)", height=300)
-        st.plotly_chart(fig_gs, use_container_width=True, config={'scrollZoom': True})
+        st.plotly_chart(fig_gs, width='stretch', config={'scrollZoom': True})
 
     # ── TAB 7: EMERGENCY DESCENT ──────────────
     with t7:
         st.write(f"`EMERGENCY DESCENT PROFILER — FLAGS SUSTAINED VSI < {EMERG_DESCENT_VSI} FPM FOR > {EMERG_DESCENT_MIN_S}s WHILE AIRBORNE`")
-        ed_events = detect_emergency_descents(df)
 
         if ed_events:
             st.info(f"🔻 **{len(ed_events)} EMERGENCY DESCENT EVENT(S) DETECTED**")
@@ -978,9 +1271,10 @@ if uploaded:
                 color, grade = acs_status_color(peak_vs_abs, 1500, 1500, lower_better=False)
 
                 with st.expander(f"ED {i+1} | {ev['time'].strftime('%H:%M:%S')} UTC | PEAK {int(peak_vs_abs)} FPM | {grade}"):
-                    col_a, col_b, col_c, col_d = st.columns(4)
+                    col_a, col_b = st.columns(2)
                     col_a.metric("ENTRY ALT",   f"{int(ev['entry_alt'])} FT MSL")
                     col_b.metric("EXIT ALT",    f"{int(ev['exit_alt'])} FT MSL")
+                    col_c, col_d = st.columns(2)
                     col_c.metric("ALT LOST",    f"{int(ev['alt_loss'])} FT")
                     col_d.metric("PEAK RATE",   f"{int(peak_vs_abs)} FPM")
 
@@ -1012,7 +1306,7 @@ if uploaded:
                                     anchor='free', position=0.92, color="#FF9F1C"),
                         legend=dict(bgcolor='rgba(0,0,0,0)')
                     )
-                    st.plotly_chart(fig_ed, use_container_width=True, config={'scrollZoom': True})
+                    st.plotly_chart(fig_ed, width='stretch', config={'scrollZoom': True})
         else:
             st.info(f"`NO EMERGENCY DESCENT EVENTS DETECTED (no sustained VSI below {EMERG_DESCENT_VSI} FPM)`")
 
@@ -1022,7 +1316,7 @@ if uploaded:
         fig_vsi.add_trace(go.Scatter(x=df['Time'], y=df['VSI'], name="VSI (FPM)", line=dict(color="#00FF41", width=1.5)))
         fig_vsi.add_hline(y=EMERG_DESCENT_VSI, line=dict(color="#FF4444", dash="dash", width=1), annotation_text=f"ED Threshold ({EMERG_DESCENT_VSI} FPM)", annotation_font_color="#FF4444")
         fig_vsi.update_layout(template="plotly_dark", xaxis_title="TIME (UTC)", yaxis_title="VERTICAL SPEED (FPM)", height=300)
-        st.plotly_chart(fig_vsi, use_container_width=True, config={'scrollZoom': True})
+        st.plotly_chart(fig_vsi, width='stretch', config={'scrollZoom': True})
 
     # ── TAB 8: PATTERN WORK GRADER ────────────
     with t8:
@@ -1032,12 +1326,9 @@ if uploaded:
         if touchdowns.empty:
             st.warning("`NO RUNWAY CONTACTS DETECTED — PATTERN ANALYSIS REQUIRES AT LEAST ONE TOUCHDOWN`")
         else:
-            pattern_alt_input = st.number_input(
-                "PATTERN ALTITUDE AGL (FT) — adjust to match your airport's published TPA",
-                min_value=400, max_value=2000, value=PATTERN_ALT_AGL, step=50
-            )
-
-            right_hand = st.checkbox("🔄 RIGHT-HAND PATTERN", value=False)
+            st.caption("`Pattern altitude & turn direction are set in the sidebar ⟵`")
+            pattern_alt_input = st.session_state.get('pattern_alt_agl', PATTERN_ALT_AGL)
+            right_hand        = st.session_state.get('right_hand_pattern', False)
 
             for t_idx, (td_index, td_row) in enumerate(touchdowns.iterrows()):
                 legs, runway_hdg, skip_reason = detect_pattern_legs(
@@ -1107,7 +1398,7 @@ if uploaded:
                     st.markdown("**PATTERN TRACK MAP:**")
                     fig_pat = go.Figure()
                     for leg_name, leg_data in legs.items():
-                        fig_pat.add_trace(go.Scattermapbox(
+                        fig_pat.add_trace(go.Scattermap(
                             lat=leg_data['Lat'], lon=leg_data['Lon'],
                             mode='lines+markers',
                             line=dict(width=4, color=leg_colors.get(leg_name, "#888")),
@@ -1118,7 +1409,7 @@ if uploaded:
                     center_lat  = all_points['Lat'].mean()
                     center_lon  = all_points['Lon'].mean()
                     fig_pat.update_layout(
-                        mapbox=dict(
+                        map=dict(
                             style="carto-darkmatter",
                             center=dict(lat=center_lat, lon=center_lon),
                             zoom=13
@@ -1128,6 +1419,25 @@ if uploaded:
                         margin=dict(l=0, r=0, b=0, t=0),
                         legend=dict(bgcolor='rgba(0,0,0,0.7)', font=dict(color='#C0C0C0'))
                     )
-                    st.plotly_chart(fig_pat, use_container_width=True, key=f"pattern_map_{t_idx}")
+                    st.plotly_chart(fig_pat, width='stretch', key=f"pattern_map_{t_idx}")
 
                 st.markdown("---")
+
+
+# ─────────────────────────────────────────────
+# DRIVER — runs the analysis with a safety net so a single malformed
+# track or an unexpected data shape shows a friendly message instead
+# of a raw traceback filling the page.
+# ─────────────────────────────────────────────
+if uploaded:
+    try:
+        run_analysis(uploaded)
+    except Exception as e:
+        st.error(
+            "⚠️ **UNEXPECTED ERROR DURING ANALYSIS** — this flight log may contain "
+            "data this build doesn't handle gracefully yet."
+        )
+        with st.expander("Technical details"):
+            st.exception(e)
+else:
+    st.info("`AWAITING KML UPLOAD — DRAG A GOOGLE EARTH TRACK LOG ABOVE TO BEGIN DEBRIEF`")
